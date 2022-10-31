@@ -14,21 +14,29 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-#
 
-LINT_OPTS ?= --timeout 1m0s
+metadata:
+  name: "service_traffic"
+  group: "sw_metric"
+tagProjection:
+  tagFamilies:
+  - name: "default"
+    tags: ["id", "service_id"]
+criteria:
+  le:
+    op: "LOGICAL_OP_AND"
+    right:
+      condition:
+        name: "id"
+        op: "BINARY_OP_EQ"
+        value:
+          str:
+            value: "1"
+    left:
+      condition:
+        name: "service_id"
+        op: "BINARY_OP_EQ"
+        value:
+          str:
+            value: "service_1"
 
-include $(mk_dir)lint-bin.mk
-
-##@ Code quality targets
-
-.PHONY: lint
-lint: $(LINTER)
-	@PATH=$(tool_bin):$(proto_dir) $(BUF) lint
-	$(LINTER) --verbose run $(LINT_OPTS) --config $(root_dir)/deprecated-golangci.yml
-
-.PHONY: format
-format: $(BUF)
-format: $(LINTER)
-	$(LINTER) --verbose run --fix -c $(root_dir)/.golangci-format.yml ./...
-	$(BUF) format -w
