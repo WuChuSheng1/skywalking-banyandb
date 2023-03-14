@@ -21,6 +21,9 @@ SERVER := $(NAME)-server
 BINARIES := $(SERVER)
 DEBUG_BINARIES := $(SERVER)-debug
 
+# // TODO: add jemalloc installation on Linux
+# BUILD_TAGS := jemalloc
+
 IMG_NAME := skywalking-banyandb
 
 include ../scripts/build/version.mk
@@ -28,7 +31,6 @@ include ../scripts/build/base.mk
 include ../scripts/build/generate_go.mk
 include ../scripts/build/build.mk
 include ../scripts/build/test.mk
-# TODO: remove this
-include ../scripts/build/lint-deprecated.mk
+include ../scripts/build/lint.mk
 include ../scripts/build/docker.mk
 include ../scripts/build/help.mk

@@ -28,6 +28,7 @@ import (
 
 	commonv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/common/v1"
 	measurev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/measure/v1"
+	modelv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/model/v1"
 	"github.com/apache/skywalking-banyandb/banyand/tsdb"
 	"github.com/apache/skywalking-banyandb/pkg/index"
 	"github.com/apache/skywalking-banyandb/pkg/logger"
@@ -39,15 +40,13 @@ import (
 var _ logical.UnresolvedPlan = (*unresolvedIndexScan)(nil)
 
 type unresolvedIndexScan struct {
-	startTime         time.Time
-	endTime           time.Time
-	metadata          *commonv1.Metadata
-	filter            index.Filter
-	projectionTags    [][]*logical.Tag
-	projectionFields  []*logical.Field
-	entities          []tsdb.Entity
-	groupByEntity     bool
-	unresolvedOrderBy *logical.UnresolvedOrderBy
+	startTime        time.Time
+	endTime          time.Time
+	metadata         *commonv1.Metadata
+	criteria         *modelv1.Criteria
+	projectionTags   [][]*logical.Tag
+	projectionFields []*logical.Field
+	groupByEntity    bool
 }
 
 func (uis *unresolvedIndexScan) Analyze(s logical.Schema) (logical.Plan, error) {
@@ -69,8 +68,15 @@ func (uis *unresolvedIndexScan) Analyze(s logical.Schema) (logical.Plan, error) 
 		}
 	}
 
-	// resolve sub-plan with the projected view of streamSchema
-	orderBySubPlan, err := uis.unresolvedOrderBy.Analyze(s.ProjTags(projTagsRefs...))
+	entityList := s.EntityList()
+	entityMap := make(map[string]int)
+	entity := make([]tsdb.Entry, len(entityList))
+	for idx, e := range entityList {
+		entityMap[e] = idx
+		// fill AnyEntry by default
+		entity[idx] = tsdb.AnyEntry
+	}
+	filter, entities, err := logical.BuildLocalFilter(uis.criteria, s, entityMap, entity)
 	if err != nil {
 		return nil, err
 	}
@@ -81,27 +87,39 @@ func (uis *unresolvedIndexScan) Analyze(s logical.Schema) (logical.Plan, error) 
 		projectionTagsRefs:   projTagsRefs,
 		projectionFieldsRefs: projFieldRefs,
 		metadata:             uis.metadata,
-		filter:               uis.filter,
-		entities:             uis.entities,
+		filter:               filter,
+		entities:             entities,
 		groupByEntity:        uis.groupByEntity,
-		OrderBy:              orderBySubPlan,
 		l:                    logger.GetLogger("query", "measure", uis.metadata.Group, uis.metadata.Name, "local-index"),
 	}, nil
 }
 
-var _ logical.Plan = (*localIndexScan)(nil)
+var (
+	_ logical.Plan          = (*localIndexScan)(nil)
+	_ logical.Sorter        = (*localIndexScan)(nil)
+	_ logical.VolumeLimiter = (*localIndexScan)(nil)
+)
 
 type localIndexScan struct {
-	*logical.OrderBy
-	timeRange            timestamp.TimeRange
 	schema               logical.Schema
-	metadata             *commonv1.Metadata
 	filter               index.Filter
+	order                *logical.OrderBy
+	metadata             *commonv1.Metadata
+	l                    *logger.Logger
+	timeRange            timestamp.TimeRange
 	projectionTagsRefs   [][]*logical.TagRef
 	projectionFieldsRefs []*logical.FieldRef
 	entities             []tsdb.Entity
 	groupByEntity        bool
-	l                    *logger.Logger
+	maxDataPointsSize    int
+}
+
+func (i *localIndexScan) Limit(max int) {
+	i.maxDataPointsSize = max
+}
+
+func (i *localIndexScan) Sort(order *logical.OrderBy) {
+	i.order = order
 }
 
 func (i *localIndexScan) Execute(ec executor.MeasureExecutionContext) (executor.MIterator, error) {
@@ -124,16 +142,16 @@ func (i *localIndexScan) Execute(ec executor.MeasureExecutionContext) (executor.
 		}
 	}
 	if len(seriesList) == 0 {
-		return executor.EmptyMIterator, nil
+		return dummyIter, nil
 	}
 	var builders []logical.SeekerBuilder
-	if i.Index != nil {
+	if i.order.Index != nil {
 		builders = append(builders, func(builder tsdb.SeekerBuilder) {
-			builder.OrderByIndex(i.Index, i.Sort)
+			builder.OrderByIndex(i.order.Index, i.order.Sort)
 		})
 	} else {
 		builders = append(builders, func(builder tsdb.SeekerBuilder) {
-			builder.OrderByTime(i.Sort)
+			builder.OrderByTime(i.order.Sort)
 		})
 	}
 	if i.filter != nil {
@@ -154,7 +172,7 @@ func (i *localIndexScan) Execute(ec executor.MeasureExecutionContext) (executor.
 	}
 
 	if len(iters) == 0 {
-		return executor.EmptyMIterator, nil
+		return dummyIter, nil
 	}
 	transformContext := transformContext{
 		ec:                   ec,
@@ -162,17 +180,16 @@ func (i *localIndexScan) Execute(ec executor.MeasureExecutionContext) (executor.
 		projectionFieldsRefs: i.projectionFieldsRefs,
 	}
 	if i.groupByEntity {
-		return newSeriesMIterator(iters, transformContext), nil
+		return newSeriesMIterator(iters, transformContext, i.maxDataPointsSize), nil
 	}
-	c := logical.CreateComparator(i.Sort)
-	it := logical.NewItemIter(iters, c)
-	return newIndexScanIterator(it, transformContext), nil
+	it := logical.NewItemIter(iters, i.order.Sort)
+	return newIndexScanIterator(it, transformContext, i.maxDataPointsSize), nil
 }
 
 func (i *localIndexScan) String() string {
-	return fmt.Sprintf("IndexScan: startTime=%d,endTime=%d,Metadata{group=%s,name=%s},conditions=%s; projection=%s; order=%s",
+	return fmt.Sprintf("IndexScan: startTime=%d,endTime=%d,Metadata{group=%s,name=%s},conditions=%s; projection=%s; order=%s; limit=%d",
 		i.timeRange.Start.Unix(), i.timeRange.End.Unix(), i.metadata.GetGroup(), i.metadata.GetName(),
-		i.filter, logical.FormatTagRefs(", ", i.projectionTagsRefs...), i.OrderBy)
+		i.filter, logical.FormatTagRefs(", ", i.projectionTagsRefs...), i.order, i.maxDataPointsSize)
 }
 
 func (i *localIndexScan) Children() []logical.Plan {
@@ -186,41 +203,41 @@ func (i *localIndexScan) Schema() logical.Schema {
 	return i.schema.ProjTags(i.projectionTagsRefs...).ProjFields(i.projectionFieldsRefs...)
 }
 
-func IndexScan(startTime, endTime time.Time, metadata *commonv1.Metadata, filter index.Filter, entities []tsdb.Entity,
-	projectionTags [][]*logical.Tag, projectionFields []*logical.Field, groupByEntity bool, unresolvedOrderBy *logical.UnresolvedOrderBy,
+func indexScan(startTime, endTime time.Time, metadata *commonv1.Metadata, projectionTags [][]*logical.Tag,
+	projectionFields []*logical.Field, groupByEntity bool, criteria *modelv1.Criteria,
 ) logical.UnresolvedPlan {
 	return &unresolvedIndexScan{
-		startTime:         startTime,
-		endTime:           endTime,
-		metadata:          metadata,
-		filter:            filter,
-		projectionTags:    projectionTags,
-		projectionFields:  projectionFields,
-		entities:          entities,
-		groupByEntity:     groupByEntity,
-		unresolvedOrderBy: unresolvedOrderBy,
+		startTime:        startTime,
+		endTime:          endTime,
+		metadata:         metadata,
+		projectionTags:   projectionTags,
+		projectionFields: projectionFields,
+		groupByEntity:    groupByEntity,
+		criteria:         criteria,
 	}
 }
 
 var _ executor.MIterator = (*indexScanIterator)(nil)
 
 type indexScanIterator struct {
-	context transformContext
 	inner   logical.ItemIterator
-
-	current *measurev1.DataPoint
 	err     error
+	current *measurev1.DataPoint
+	context transformContext
+	max     int
+	num     int
 }
 
-func newIndexScanIterator(inner logical.ItemIterator, context transformContext) executor.MIterator {
+func newIndexScanIterator(inner logical.ItemIterator, context transformContext, max int) executor.MIterator {
 	return &indexScanIterator{
 		inner:   inner,
 		context: context,
+		max:     max,
 	}
 }
 
 func (ism *indexScanIterator) Next() bool {
-	if !ism.inner.HasNext() || ism.err != nil {
+	if !ism.inner.HasNext() || ism.err != nil || ism.num > ism.max {
 		return false
 	}
 	nextItem := ism.inner.Next()
@@ -228,6 +245,7 @@ func (ism *indexScanIterator) Next() bool {
 	if ism.current, err = transform(nextItem, ism.context); err != nil {
 		ism.err = multierr.Append(ism.err, err)
 	}
+	ism.num++
 	return true
 }
 
@@ -245,24 +263,26 @@ func (ism *indexScanIterator) Close() error {
 var _ executor.MIterator = (*seriesIterator)(nil)
 
 type seriesIterator struct {
-	inner   []tsdb.Iterator
-	context transformContext
-
-	index   int
-	current []*measurev1.DataPoint
 	err     error
+	context transformContext
+	inner   []tsdb.Iterator
+	current []*measurev1.DataPoint
+	index   int
+	num     int
+	max     int
 }
 
-func newSeriesMIterator(inner []tsdb.Iterator, context transformContext) executor.MIterator {
+func newSeriesMIterator(inner []tsdb.Iterator, context transformContext, max int) executor.MIterator {
 	return &seriesIterator{
 		inner:   inner,
 		context: context,
 		index:   -1,
+		max:     max,
 	}
 }
 
 func (ism *seriesIterator) Next() bool {
-	if ism.err != nil {
+	if ism.err != nil || ism.num > ism.max {
 		return false
 	}
 	ism.index++
@@ -281,6 +301,7 @@ func (ism *seriesIterator) Next() bool {
 		}
 		ism.current = append(ism.current, dp)
 	}
+	ism.num++
 	return true
 }
 
@@ -319,4 +340,20 @@ func transform(item tsdb.Item, ism transformContext) (*measurev1.DataPoint, erro
 		TagFamilies: tagFamilies,
 		Timestamp:   timestamppb.New(time.Unix(0, int64(item.Time()))),
 	}, nil
+}
+
+var dummyIter = dummyMIterator{}
+
+type dummyMIterator struct{}
+
+func (ei dummyMIterator) Next() bool {
+	return false
+}
+
+func (ei dummyMIterator) Current() []*measurev1.DataPoint {
+	return nil
+}
+
+func (ei dummyMIterator) Close() error {
+	return nil
 }

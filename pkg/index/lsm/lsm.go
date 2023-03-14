@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Package lsm implements a tree-based index repository.
 package lsm
 
 import (
@@ -45,29 +46,25 @@ func (s *store) Close() error {
 
 func (s *store) Write(fields []index.Field, itemID common.ItemID) (err error) {
 	for _, field := range fields {
-		f, errInternal := field.Marshal()
-		if errInternal != nil {
-			err = multierr.Append(err, errInternal)
-			continue
-		}
 		itemIDInt := uint64(itemID)
-		err = multierr.Append(err, s.lsm.PutWithVersion(f, convert.Uint64ToBytes(itemIDInt), itemIDInt))
+		err = multierr.Append(err, s.lsm.PutWithVersion(field.Marshal(), convert.Uint64ToBytes(itemIDInt), itemIDInt))
 	}
 	return err
 }
 
+// StoreOpts wraps options to create the lsm repository.
 type StoreOpts struct {
-	Path         string
 	Logger       *logger.Logger
+	Path         string
 	MemTableSize int64
 }
 
+// NewStore creates a new lsm index repository.
 func NewStore(opts StoreOpts) (index.Store, error) {
 	var err error
 	var lsm kv.Store
 	if lsm, err = kv.OpenStore(
-		0,
-		opts.Path+"/lsm",
+		opts.Path,
 		kv.StoreWithLogger(opts.Logger),
 		kv.StoreWithMemTableSize(opts.MemTableSize)); err != nil {
 		return nil, err

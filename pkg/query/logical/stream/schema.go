@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Package stream implements execution operations for querying stream data.
 package stream
 
 import (
@@ -32,7 +33,11 @@ type schema struct {
 	common *logical.CommonSchema
 }
 
-func (s *schema) CreateFieldRef(fields ...*logical.Field) ([]*logical.FieldRef, error) {
+func (s *schema) FindTagSpecByName(name string) *logical.TagSpec {
+	return s.common.FindTagSpecByName(name)
+}
+
+func (s *schema) CreateFieldRef(_ ...*logical.Field) ([]*logical.FieldRef, error) {
 	panic("no field for stream")
 }
 
@@ -44,21 +49,16 @@ func (s *schema) EntityList() []string {
 	return s.common.EntityList
 }
 
-// IndexDefined checks whether the field given is indexed
+// IndexDefined checks whether the field given is indexed.
 func (s *schema) IndexDefined(tagName string) (bool, *databasev1.IndexRule) {
 	return s.common.IndexDefined(tagName)
 }
 
 func (s *schema) Equal(s2 logical.Schema) bool {
 	if other, ok := s2.(*schema); ok {
-		return cmp.Equal(other.common.TagMap, s.common.TagMap)
+		return cmp.Equal(other.common.TagSpecMap, s.common.TagSpecMap)
 	}
 	return false
-}
-
-// registerTag registers the tag spec with given tagFamilyName, tagName and indexes.
-func (s *schema) registerTag(tagFamilyIdx, tagIdx int, spec *databasev1.TagSpec) {
-	s.common.RegisterTag(tagFamilyIdx, tagIdx, spec)
 }
 
 // CreateTagRef create TagRef to the given tags.
@@ -69,7 +69,7 @@ func (s *schema) CreateTagRef(tags ...[]*logical.Tag) ([][]*logical.TagRef, erro
 }
 
 // ProjTags creates a projection view from the present streamSchema
-// with a given list of projections
+// with a given list of projections.
 func (s *schema) ProjTags(refs ...[]*logical.TagRef) logical.Schema {
 	if len(refs) == 0 {
 		return nil
@@ -83,10 +83,6 @@ func (s *schema) ProjTags(refs ...[]*logical.TagRef) logical.Schema {
 
 func (s *schema) ProjFields(...*logical.FieldRef) logical.Schema {
 	panic("stream does not support field")
-}
-
-func (s *schema) ShardNumber() uint32 {
-	return s.common.ShardNumber()
 }
 
 func (s *schema) Scope() tsdb.Entry {

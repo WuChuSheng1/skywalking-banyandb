@@ -25,7 +25,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/zenizh/go-capturer"
 
-	database_v1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
+	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/cmd"
 	"github.com/apache/skywalking-banyandb/pkg/test/flags"
 	"github.com/apache/skywalking-banyandb/pkg/test/helpers"
@@ -37,7 +37,7 @@ var _ = Describe("IndexRuleBindingSchema Operation", func() {
 	var deferFunc func()
 	var rootCmd *cobra.Command
 	BeforeEach(func() {
-		_, addr, deferFunc = setup.SetUp()
+		_, addr, deferFunc = setup.Common()
 		Eventually(helpers.HTTPHealthCheck(addr), flags.EventuallyTimeout).Should(Succeed())
 		addr = "http://" + addr
 		// extracting the operation of creating indexRuleBinding schema
@@ -74,9 +74,15 @@ resource_opts:
 metadata:
   name: name1
   group: group1
+rules: [
+    "service_id",
+    "searchable_name"
+  ]
 subject:
   catalog: CATALOG_STREAM
-  name: stream1`))
+  name: stream1
+begin_at: 2021-04-15T01:30:15.01Z
+expire_at: 2121-04-15T01:30:15.01Z`))
 			return capturer.CaptureStdout(func() {
 				err := rootCmd.Execute()
 				if err != nil {
@@ -94,7 +100,7 @@ subject:
 			Expect(err).NotTo(HaveOccurred())
 		})
 		GinkgoWriter.Println(out)
-		resp := new(database_v1.IndexRuleBindingRegistryServiceGetResponse)
+		resp := new(databasev1.IndexRuleBindingRegistryServiceGetResponse)
 		helpers.UnmarshalYAML([]byte(out), resp)
 		Expect(resp.IndexRuleBinding.Metadata.Group).To(Equal("group1"))
 		Expect(resp.IndexRuleBinding.Metadata.Name).To(Equal("name1"))
@@ -107,9 +113,15 @@ subject:
 metadata:
   name: name1
   group: group1
+rules: [
+    "service_id",
+    "searchable_name"
+  ]
 subject:
   catalog: CATALOG_STREAM
-  name: stream2`))
+  name: stream2
+begin_at: 2021-04-15T01:30:15.01Z
+expire_at: 2121-04-15T01:30:15.01Z`))
 		out := capturer.CaptureStdout(func() {
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
@@ -120,7 +132,7 @@ subject:
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
 		})
-		resp := new(database_v1.IndexRuleBindingRegistryServiceGetResponse)
+		resp := new(databasev1.IndexRuleBindingRegistryServiceGetResponse)
 		helpers.UnmarshalYAML([]byte(out), resp)
 		Expect(resp.IndexRuleBinding.Metadata.Group).To(Equal("group1"))
 		Expect(resp.IndexRuleBinding.Metadata.Name).To(Equal("name1"))
@@ -148,9 +160,15 @@ subject:
 metadata:
   name: name2
   group: group1
+rules: [
+    "service_id",
+    "searchable_name"
+  ]
 subject:
   catalog: CATALOG_STREAM
-  name: stream2`))
+  name: stream2
+begin_at: 2021-04-15T01:30:15.01Z
+expire_at: 2121-04-15T01:30:15.01Z`))
 		out := capturer.CaptureStdout(func() {
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
@@ -162,7 +180,7 @@ subject:
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
 		})
-		resp := new(database_v1.IndexRuleBindingRegistryServiceListResponse)
+		resp := new(databasev1.IndexRuleBindingRegistryServiceListResponse)
 		helpers.UnmarshalYAML([]byte(out), resp)
 		Expect(resp.IndexRuleBinding).To(HaveLen(2))
 	})

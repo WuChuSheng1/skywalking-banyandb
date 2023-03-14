@@ -15,15 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Package encoding implements encoding/decoding data points.
 package encoding
 
 import (
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
-
-var ErrEncodeEmpty = errors.New("encode an empty value")
 
 var (
 	rawSize = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -43,31 +41,33 @@ var (
 	}, []string{"name", "type"})
 )
 
+// SeriesEncoderPool allows putting and getting SeriesEncoder.
 type SeriesEncoderPool interface {
-	Get(metadata []byte) SeriesEncoder
+	Get(metadata []byte, buffer BufferWriter) SeriesEncoder
 	Put(encoder SeriesEncoder)
 }
 
-// SeriesEncoder encodes time series data point
+// SeriesEncoder encodes time series data point.
 type SeriesEncoder interface {
 	// Append a data point
 	Append(ts uint64, value []byte)
 	// IsFull returns whether the encoded data reached its capacity
 	IsFull() bool
 	// Reset the underlying buffer
-	Reset(key []byte)
+	Reset(key []byte, buffer BufferWriter)
 	// Encode the time series data point to a binary
-	Encode() ([]byte, error)
+	Encode() error
 	// StartTime indicates the first entry's time
 	StartTime() uint64
 }
 
+// SeriesDecoderPool allows putting and getting SeriesDecoder.
 type SeriesDecoderPool interface {
 	Get(metadata []byte) SeriesDecoder
 	Put(encoder SeriesDecoder)
 }
 
-// SeriesDecoder decodes encoded time series data
+// SeriesDecoder decodes encoded time series data.
 type SeriesDecoder interface {
 	// Decode the time series data
 	Decode(key, data []byte) error
@@ -83,7 +83,7 @@ type SeriesDecoder interface {
 	Range() (start, end uint64)
 }
 
-// SeriesIterator iterates time series data
+// SeriesIterator iterates time series data.
 type SeriesIterator interface {
 	// Next scroll the cursor to the next
 	Next() bool
@@ -93,4 +93,11 @@ type SeriesIterator interface {
 	Time() uint64
 	// Error might return an error indicates a decode failure
 	Error() error
+}
+
+// BufferWriter allows writing a variable-sized buffer of bytes.
+type BufferWriter interface {
+	Write(data []byte) (n int, err error)
+	WriteByte(b byte) error
+	Bytes() []byte
 }

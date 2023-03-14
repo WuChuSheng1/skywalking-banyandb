@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Package kv implements a key-value engine.
 package kv
 
 import (
@@ -23,6 +24,7 @@ import (
 	"math"
 
 	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/badger/v3/options"
 	"github.com/pkg/errors"
 
 	"github.com/apache/skywalking-banyandb/banyand/observability"
@@ -31,28 +33,33 @@ import (
 )
 
 var (
-	ErrStopScan     = errors.New("stop scanning")
+	errStopScan = errors.New("stop scanning")
+
+	// DefaultScanOpts is a helper to provides canonical options for scanning.
 	DefaultScanOpts = ScanOpts{
 		PrefetchSize:   100,
 		PrefetchValues: true,
 	}
 )
 
-type Writer interface {
+type writer interface {
 	// Put a value
 	Put(key, val []byte) error
 	PutWithVersion(key, val []byte, version uint64) error
 }
 
-type ScanFunc func(shardID int, key []byte, getVal func() ([]byte, error)) error
+// ScanFunc is the closure executed on scanning out a pair of key-value.
+type ScanFunc func(key []byte, getVal func() ([]byte, error)) error
 
+// ScanOpts wraps options for scanning the kv storage.
 type ScanOpts struct {
+	Prefix         []byte
 	PrefetchSize   int
 	PrefetchValues bool
 	Reverse        bool
-	Prefix         []byte
 }
 
+// Reader allows retrieving data from kv.
 type Reader interface {
 	Iterable
 	// Get a value by its key
@@ -61,14 +68,15 @@ type Reader interface {
 	Scan(prefix, seekKey []byte, opt ScanOpts, f ScanFunc) error
 }
 
-// Store is a common kv storage with auto-generated key
+// Store is a common kv storage with auto-generated key.
 type Store interface {
 	observability.Observable
 	io.Closer
-	Writer
+	writer
 	Reader
 }
 
+// TimeSeriesWriter allows writing to a time-series storage.
 type TimeSeriesWriter interface {
 	// Put a value with a timestamp/version
 	Put(key, val []byte, ts uint64) error
@@ -77,13 +85,13 @@ type TimeSeriesWriter interface {
 	PutAsync(key, val []byte, ts uint64, f func(error)) error
 }
 
+// TimeSeriesReader allows retrieving data from a time-series storage.
 type TimeSeriesReader interface {
 	// Get a value by its key and timestamp/version
 	Get(key []byte, ts uint64) ([]byte, error)
-	Context(key []byte, ts uint64, n int) (pre, next Iterator)
 }
 
-// TimeSeriesStore is time series storage
+// TimeSeriesStore is time series storage.
 type TimeSeriesStore interface {
 	observability.Observable
 	io.Closer
@@ -91,9 +99,10 @@ type TimeSeriesStore interface {
 	TimeSeriesReader
 }
 
+// TimeSeriesOptions sets an options for creating a TimeSeriesStore.
 type TimeSeriesOptions func(TimeSeriesStore)
 
-// TSSWithLogger sets a external logger into underlying TimeSeriesStore
+// TSSWithLogger sets a external logger into underlying TimeSeriesStore.
 func TSSWithLogger(l *logger.Logger) TimeSeriesOptions {
 	return func(store TimeSeriesStore) {
 		if btss, ok := store.(*badgerTSS); ok {
@@ -104,38 +113,46 @@ func TSSWithLogger(l *logger.Logger) TimeSeriesOptions {
 	}
 }
 
-func TSSWithEncoding(encoderPool encoding.SeriesEncoderPool, decoderPool encoding.SeriesDecoderPool) TimeSeriesOptions {
+// TSSWithEncoding sets encoding and decoding pools for building chunks.
+func TSSWithEncoding(encoderPool encoding.SeriesEncoderPool, decoderPool encoding.SeriesDecoderPool, chunkSize int) TimeSeriesOptions {
 	return func(store TimeSeriesStore) {
 		if btss, ok := store.(*badgerTSS); ok {
-			btss.dbOpts = btss.dbOpts.WithExternalCompactor(
+			btss.dbOpts = btss.dbOpts.WithKeyBasedEncoder(
 				&encoderPoolDelegate{
 					encoderPool,
 				}, &decoderPoolDelegate{
 					decoderPool,
-				})
+				}, chunkSize)
 		}
 	}
 }
 
-func TSSWithFlushCallback(callback func()) TimeSeriesOptions {
+// TSSWithZSTDCompression sets a ZSTD based compression method.
+func TSSWithZSTDCompression(chunkSize int) TimeSeriesOptions {
 	return func(store TimeSeriesStore) {
 		if btss, ok := store.(*badgerTSS); ok {
-			btss.dbOpts.FlushCallBack = callback
+			btss.dbOpts = btss.dbOpts.
+				WithCompression(options.ZSTD).
+				WithBlockSize(chunkSize).
+				WithSameKeyBlock()
 		}
 	}
 }
 
-func TSSWithMemTableSize(size int64) TimeSeriesOptions {
+// TSSWithMemTableSize sets the size of memory table in bytes.
+func TSSWithMemTableSize(sizeInBytes int64) TimeSeriesOptions {
 	return func(store TimeSeriesStore) {
-		if size < 1 {
+		if sizeInBytes < 1 {
 			return
 		}
 		if btss, ok := store.(*badgerTSS); ok {
-			btss.dbOpts.MemTableSize = size
+			btss.dbOpts.MemTableSize = sizeInBytes
 		}
 	}
 }
 
+// Iterator allows iterating the kv tables.
+// TODO: use generic to provide a unique iterator.
 type Iterator interface {
 	Next()
 	Rewind()
@@ -147,29 +164,29 @@ type Iterator interface {
 	Close() error
 }
 
+// Iterable allows creating a Iterator.
 type Iterable interface {
 	NewIterator(opt ScanOpts) Iterator
 }
 
-type HandoverCallback func()
-
+// IndexStore allows writing and reading index format data.
 type IndexStore interface {
 	observability.Observable
 	Iterable
 	Reader
-	Handover(iterator Iterator) error
 	Close() error
 }
 
-// OpenTimeSeriesStore creates a new TimeSeriesStore
-func OpenTimeSeriesStore(shardID int, path string, options ...TimeSeriesOptions) (TimeSeriesStore, error) {
+// OpenTimeSeriesStore creates a new TimeSeriesStore.
+// nolint: contextcheck
+func OpenTimeSeriesStore(path string, options ...TimeSeriesOptions) (TimeSeriesStore, error) {
 	btss := new(badgerTSS)
-	btss.shardID = shardID
 	btss.dbOpts = badger.DefaultOptions(path)
 	for _, opt := range options {
 		opt(btss)
 	}
 	// Put all values into LSM
+	btss.dbOpts = btss.dbOpts.WithNumVersionsToKeep(math.MaxUint32)
 	btss.dbOpts = btss.dbOpts.WithVLogPercentile(1.0)
 	if btss.dbOpts.MemTableSize < 8<<20 {
 		btss.dbOpts = btss.dbOpts.WithValueThreshold(1 << 10)
@@ -177,20 +194,21 @@ func OpenTimeSeriesStore(shardID int, path string, options ...TimeSeriesOptions)
 	var err error
 	btss.db, err = badger.Open(btss.dbOpts)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open time series store: %v", err)
+		return nil, fmt.Errorf("failed to open time series store: %w", err)
 	}
 	btss.TSet = *badger.NewTSet(btss.db)
 	return btss, nil
 }
 
+// StoreOptions sets options for creating Store.
 type StoreOptions func(Store)
 
-// StoreWithLogger sets a external logger into underlying Store
+// StoreWithLogger sets a external logger into underlying Store.
 func StoreWithLogger(l *logger.Logger) StoreOptions {
 	return StoreWithNamedLogger("normal-kv", l)
 }
 
-// StoreWithNamedLogger sets a external logger with a name into underlying Store
+// StoreWithNamedLogger sets a external logger with a name into underlying Store.
 func StoreWithNamedLogger(name string, l *logger.Logger) StoreOptions {
 	return func(store Store) {
 		if bdb, ok := store.(*badgerDB); ok {
@@ -201,7 +219,7 @@ func StoreWithNamedLogger(name string, l *logger.Logger) StoreOptions {
 	}
 }
 
-// StoreWithMemTableSize sets MemTable size
+// StoreWithMemTableSize sets MemTable size.
 func StoreWithMemTableSize(size int64) StoreOptions {
 	return func(store Store) {
 		if size < 1 {
@@ -213,10 +231,10 @@ func StoreWithMemTableSize(size int64) StoreOptions {
 	}
 }
 
-// OpenStore creates a new Store
-func OpenStore(shardID int, path string, options ...StoreOptions) (Store, error) {
+// OpenStore creates a new Store.
+// nolint: contextcheck
+func OpenStore(path string, options ...StoreOptions) (Store, error) {
 	bdb := new(badgerDB)
-	bdb.shardID = shardID
 	bdb.dbOpts = badger.DefaultOptions(path)
 	for _, opt := range options {
 		opt(bdb)
@@ -229,14 +247,15 @@ func OpenStore(shardID int, path string, options ...StoreOptions) (Store, error)
 	var err error
 	bdb.db, err = badger.Open(bdb.dbOpts)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open normal store: %v", err)
+		return nil, fmt.Errorf("failed to open normal store: %w", err)
 	}
 	return bdb, nil
 }
 
+// IndexOptions sets options for creating the index store.
 type IndexOptions func(store IndexStore)
 
-// IndexWithLogger sets a external logger into underlying IndexStore
+// IndexWithLogger sets a external logger into underlying IndexStore.
 func IndexWithLogger(l *logger.Logger) IndexOptions {
 	return func(store IndexStore) {
 		if bdb, ok := store.(*badgerDB); ok {
@@ -247,10 +266,9 @@ func IndexWithLogger(l *logger.Logger) IndexOptions {
 	}
 }
 
-// OpenIndexStore creates a new IndexStore
-func OpenIndexStore(shardID int, path string, options ...IndexOptions) (IndexStore, error) {
+// OpenIndexStore creates a new IndexStore.
+func OpenIndexStore(path string, options ...IndexOptions) (IndexStore, error) {
 	bdb := new(badgerDB)
-	bdb.shardID = shardID
 	bdb.dbOpts = badger.DefaultOptions(path)
 	for _, opt := range options {
 		opt(bdb)
@@ -263,7 +281,7 @@ func OpenIndexStore(shardID int, path string, options ...IndexOptions) (IndexSto
 	var err error
 	bdb.db, err = badger.Open(bdb.dbOpts)
 	if err != nil {
-		return nil, fmt.Errorf("failed to index store: %v", err)
+		return nil, fmt.Errorf("failed to index store: %w", err)
 	}
 	return bdb, nil
 }

@@ -19,12 +19,13 @@ package kv
 
 import (
 	"bytes"
+	"errors"
 	"log"
 	"math"
 	"time"
 
 	"github.com/dgraph-io/badger/v3"
-	"github.com/dgraph-io/badger/v3/bydb"
+	"github.com/dgraph-io/badger/v3/banyandb"
 	"github.com/dgraph-io/badger/v3/y"
 
 	"github.com/apache/skywalking-banyandb/banyand/observability"
@@ -33,42 +34,30 @@ import (
 )
 
 var (
-	_              Store           = (*badgerDB)(nil)
-	_              IndexStore      = (*badgerDB)(nil)
-	_              y.Iterator      = (*mergedIter)(nil)
-	_              TimeSeriesStore = (*badgerTSS)(nil)
-	bitMergeEntry  byte            = 1 << 3
-	ErrKeyNotFound                 = badger.ErrKeyNotFound
+	_             Store           = (*badgerDB)(nil)
+	_             IndexStore      = (*badgerDB)(nil)
+	_             y.Iterator      = (*mergedIter)(nil)
+	_             TimeSeriesStore = (*badgerTSS)(nil)
+	bitMergeEntry byte            = 1 << 3
+	// ErrKeyNotFound denotes the expected key can not be got from the kv service.
+	ErrKeyNotFound = badger.ErrKeyNotFound
 )
 
 type badgerTSS struct {
-	shardID int
-	dbOpts  badger.Options
-	db      *badger.DB
 	badger.TSet
-}
-
-func (b *badgerTSS) Context(key []byte, ts uint64, n int) (pre Iterator, next Iterator) {
-	preOpts := badger.DefaultIteratorOptions
-	preOpts.PrefetchSize = n
-	preOpts.PrefetchValues = false
-	preOpts.Prefix = key
-	preOpts.Reverse = false
-	nextOpts := badger.DefaultIteratorOptions
-	nextOpts.PrefetchSize = n
-	nextOpts.PrefetchValues = false
-	nextOpts.Prefix = key
-	nextOpts.Reverse = true
-	seekKey := y.KeyWithTs(key, ts)
-	preIter := b.db.NewIterator(preOpts)
-	preIter.Seek(seekKey)
-	nextIter := b.db.NewIterator(nextOpts)
-	nextIter.Seek(seekKey)
-	return &iterator{delegated: preIter}, &iterator{delegated: nextIter, reverse: true}
+	db     *badger.DB
+	dbOpts badger.Options
 }
 
 func (b *badgerTSS) Stats() (s observability.Statistics) {
 	return badgerStats(b.db)
+}
+
+func (b *badgerTSS) Close() error {
+	if b.db != nil && !b.db.IsClosed() {
+		return b.db.Close()
+	}
+	return nil
 }
 
 func badgerStats(db *badger.DB) (s observability.Statistics) {
@@ -79,17 +68,10 @@ func badgerStats(db *badger.DB) (s observability.Statistics) {
 	}
 }
 
-func (b *badgerTSS) Close() error {
-	if b.db != nil && !b.db.IsClosed() {
-		return b.db.Close()
-	}
-	return nil
-}
-
 type mergedIter struct {
 	delegated Iterator
-	valid     bool
 	data      []byte
+	valid     bool
 }
 
 func (i *mergedIter) Next() {
@@ -137,19 +119,12 @@ func (i mergedIter) Value() y.ValueStruct {
 }
 
 type badgerDB struct {
-	shardID int
-	dbOpts  badger.Options
-	db      *badger.DB
+	db     *badger.DB
+	dbOpts badger.Options
 }
 
 func (b *badgerDB) Stats() observability.Statistics {
 	return badgerStats(b.db)
-}
-
-func (b *badgerDB) Handover(iterator Iterator) error {
-	return b.db.HandoverIterator(&mergedIter{
-		delegated: iterator,
-	})
 }
 
 func (b *badgerDB) Scan(prefix, seekKey []byte, opt ScanOpts, f ScanFunc) error {
@@ -169,10 +144,10 @@ func (b *badgerDB) Scan(prefix, seekKey []byte, opt ScanOpts, f ScanFunc) error 
 		if !bytes.Equal(prefix, k[0:len(prefix)]) {
 			continue
 		}
-		err := f(b.shardID, k, func() ([]byte, error) {
+		err := f(k, func() ([]byte, error) {
 			return y.Copy(it.Value().Value), nil
 		})
-		if err == ErrStopScan {
+		if errors.Is(err, errStopScan) {
 			break
 		}
 		if err != nil {
@@ -185,8 +160,8 @@ func (b *badgerDB) Scan(prefix, seekKey []byte, opt ScanOpts, f ScanFunc) error 
 var _ Iterator = (*iterator)(nil)
 
 type iterator struct {
-	reverse   bool
 	delegated y.Iterator
+	reverse   bool
 }
 
 func (i *iterator) Next() {
@@ -255,7 +230,7 @@ func (b *badgerDB) PutWithVersion(key, val []byte, version uint64) error {
 
 func (b *badgerDB) Get(key []byte) ([]byte, error) {
 	v, err := b.db.Get(y.KeyWithTs(key, math.MaxInt64))
-	if err == badger.ErrKeyNotFound {
+	if errors.Is(err, badger.ErrKeyNotFound) {
 		return nil, ErrKeyNotFound
 	}
 	if err != nil {
@@ -283,7 +258,7 @@ func (b *badgerDB) GetAll(key []byte, applyFn func([]byte) error) error {
 	return ErrKeyNotFound
 }
 
-// badgerLog delegates the zap log to the badger logger
+// badgerLog delegates the zap log to the badger logger.
 type badgerLog struct {
 	*log.Logger
 	delegated *logger.Logger
@@ -305,50 +280,74 @@ func (l *badgerLog) Debugf(f string, v ...interface{}) {
 	l.delegated.Debug().Msgf(f, v...)
 }
 
-var _ bydb.TSetEncoderPool = (*encoderPoolDelegate)(nil)
+var _ banyandb.SeriesEncoderPool = (*encoderPoolDelegate)(nil)
 
 type encoderPoolDelegate struct {
 	encoding.SeriesEncoderPool
 }
 
-func (e *encoderPoolDelegate) Get(metadata []byte) bydb.TSetEncoder {
-	return e.SeriesEncoderPool.Get(metadata)
+func (e *encoderPoolDelegate) Get(metadata []byte, buffer banyandb.Buffer) banyandb.SeriesEncoder {
+	encoder := e.SeriesEncoderPool.Get(metadata, buffer)
+	if encoder == nil {
+		return nil
+	}
+	return &encoderDelegate{SeriesEncoder: encoder}
 }
 
-func (e *encoderPoolDelegate) Put(encoder bydb.TSetEncoder) {
-	e.SeriesEncoderPool.Put(encoder)
+func (e *encoderPoolDelegate) Put(encoder banyandb.SeriesEncoder) {
+	ee := encoder.(*encoderDelegate)
+	e.SeriesEncoderPool.Put(ee.SeriesEncoder)
 }
 
-var _ bydb.TSetDecoderPool = (*decoderPoolDelegate)(nil)
+var _ banyandb.SeriesEncoder = (*encoderDelegate)(nil)
+
+type encoderDelegate struct {
+	encoding.SeriesEncoder
+}
+
+func (e *encoderDelegate) Reset(key []byte, buffer banyandb.Buffer) {
+	e.SeriesEncoder.Reset(key, &bufferDelegate{BufferWriter: buffer})
+}
+
+var _ encoding.BufferWriter = (*bufferDelegate)(nil)
+
+type bufferDelegate struct {
+	encoding.BufferWriter
+}
+
+var _ banyandb.SeriesDecoderPool = (*decoderPoolDelegate)(nil)
 
 type decoderPoolDelegate struct {
 	encoding.SeriesDecoderPool
 }
 
-func (e *decoderPoolDelegate) Get(metadata []byte) bydb.TSetDecoder {
-	return &decoderDelegate{
-		e.SeriesDecoderPool.Get(metadata),
+func (e *decoderPoolDelegate) Get(metadata []byte) banyandb.SeriesDecoder {
+	if decoder := e.SeriesDecoderPool.Get(metadata); decoder != nil {
+		return &decoderDelegate{
+			e.SeriesDecoderPool.Get(metadata),
+		}
+	}
+	return nil
+}
+
+func (e *decoderPoolDelegate) Put(decoder banyandb.SeriesDecoder) {
+	if decoder != nil {
+		dd := decoder.(*decoderDelegate)
+		e.SeriesDecoderPool.Put(dd.SeriesDecoder)
 	}
 }
 
-func (e *decoderPoolDelegate) Put(decoder bydb.TSetDecoder) {
-	dd := decoder.(*decoderDelegate)
-	e.SeriesDecoderPool.Put(dd.SeriesDecoder)
-}
-
-var _ bydb.TSetDecoder = (*decoderDelegate)(nil)
+var _ banyandb.SeriesDecoder = (*decoderDelegate)(nil)
 
 type decoderDelegate struct {
 	encoding.SeriesDecoder
 }
 
-func (d *decoderDelegate) Iterator() bydb.TSetIterator {
+func (d *decoderDelegate) Iterator() banyandb.SeriesIterator {
 	return &iterDelegate{
 		SeriesIterator: d.SeriesDecoder.Iterator(),
 	}
 }
-
-var _ bydb.TSetDecoder = (*decoderDelegate)(nil)
 
 type iterDelegate struct {
 	encoding.SeriesIterator

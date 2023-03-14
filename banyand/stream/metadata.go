@@ -30,7 +30,6 @@ import (
 	"github.com/apache/skywalking-banyandb/banyand/metadata"
 	"github.com/apache/skywalking-banyandb/banyand/metadata/schema"
 	"github.com/apache/skywalking-banyandb/banyand/tsdb"
-	"github.com/apache/skywalking-banyandb/pkg/encoding"
 	"github.com/apache/skywalking-banyandb/pkg/logger"
 	pb_v1 "github.com/apache/skywalking-banyandb/pkg/pb/v1/tsdb"
 	resourceSchema "github.com/apache/skywalking-banyandb/pkg/schema"
@@ -172,10 +171,10 @@ func (sr *schemaRepo) loadStream(metadata *commonv1.Metadata) (*stream, bool) {
 var _ resourceSchema.ResourceSupplier = (*supplier)(nil)
 
 type supplier struct {
-	path     string
-	dbOpts   tsdb.DatabaseOpts
 	metadata metadata.Repo
 	l        *logger.Logger
+	path     string
+	dbOpts   tsdb.DatabaseOpts
 }
 
 func newSupplier(path string, metadata metadata.Repo, dbOpts tsdb.DatabaseOpts, l *logger.Logger) *supplier {
@@ -192,10 +191,10 @@ func (s *supplier) OpenResource(shardNum uint32, db tsdb.Supplier, spec resource
 	return openStream(shardNum, db, streamSpec{
 		schema:     streamSchema,
 		indexRules: spec.IndexRules,
-	}, s.l)
+	}, s.l), nil
 }
 
-func (s *supplier) ResourceSchema(repo metadata.Repo, md *commonv1.Metadata) (resourceSchema.ResourceSchema, error) {
+func (s *supplier) ResourceSchema(md *commonv1.Metadata) (resourceSchema.ResourceSchema, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return s.metadata.StreamRegistry().GetStream(ctx, md)
@@ -206,9 +205,9 @@ func (s *supplier) OpenDB(groupSchema *commonv1.Group) (tsdb.Database, error) {
 	opts := s.dbOpts
 	opts.ShardNum = groupSchema.ResourceOpts.ShardNum
 	opts.Location = path.Join(s.path, groupSchema.Metadata.Name)
-	opts.EncodingMethod = tsdb.EncodingMethod{
-		EncoderPool: encoding.NewPlainEncoderPool(name, chunkSize),
-		DecoderPool: encoding.NewPlainDecoderPool(name, chunkSize),
+	opts.CompressionMethod = tsdb.CompressionMethod{
+		Type:             tsdb.CompressionTypeZSTD,
+		ChunkSizeInBytes: chunkSize,
 	}
 	var err error
 	if opts.BlockInterval, err = pb_v1.ToIntervalRule(groupSchema.ResourceOpts.BlockInterval); err != nil {

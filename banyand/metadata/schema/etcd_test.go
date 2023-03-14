@@ -136,7 +136,7 @@ func useRandomPort() RegistryOption {
 
 func Test_Etcd_Entity_Get(t *testing.T) {
 	tester := assert.New(t)
-	registry, err := NewEtcdSchemaRegistry(useRandomPort(), useRandomTempDir(), LoggerLevel("warn"))
+	registry, err := NewEtcdSchemaRegistry(useRandomPort(), useRandomTempDir())
 	tester.NoError(err)
 	tester.NotNil(registry)
 	defer registry.Close()
@@ -145,9 +145,9 @@ func Test_Etcd_Entity_Get(t *testing.T) {
 	tester.NoError(err)
 
 	tests := []struct {
-		name        string
 		meta        *commonv1.Metadata
 		get         func(Registry, *commonv1.Metadata) (HasMetadata, error)
+		name        string
 		expectedErr bool
 	}{
 		{
@@ -228,7 +228,7 @@ func Test_Etcd_Entity_Get(t *testing.T) {
 
 func Test_Etcd_Entity_List(t *testing.T) {
 	tester := assert.New(t)
-	registry, err := NewEtcdSchemaRegistry(useRandomPort(), useRandomTempDir(), LoggerLevel("warn"))
+	registry, err := NewEtcdSchemaRegistry(useRandomPort(), useRandomTempDir())
 	tester.NoError(err)
 	tester.NotNil(registry)
 	defer registry.Close()
@@ -237,8 +237,8 @@ func Test_Etcd_Entity_List(t *testing.T) {
 	tester.NoError(err)
 
 	tests := []struct {
-		name        string
 		list        func(Registry) (int, error)
+		name        string
 		expectedLen int
 	}{
 		{
@@ -310,7 +310,7 @@ func Test_Etcd_Entity_List(t *testing.T) {
 
 func Test_Etcd_Delete(t *testing.T) {
 	tester := assert.New(t)
-	registry, err := NewEtcdSchemaRegistry(useRandomPort(), useRandomTempDir(), LoggerLevel("warn"))
+	registry, err := NewEtcdSchemaRegistry(useRandomPort(), useRandomTempDir())
 	tester.NoError(err)
 	tester.NotNil(registry)
 	defer registry.Close()
@@ -319,9 +319,9 @@ func Test_Etcd_Delete(t *testing.T) {
 	tester.NoError(err)
 
 	tests := []struct {
-		name              string
 		list              func(Registry) (int, error)
 		delete            func(Registry) error
+		name              string
 		expectedLenBefore int
 		expectedLenAfter  int
 	}{
@@ -379,7 +379,7 @@ func Test_Etcd_Delete(t *testing.T) {
 
 func Test_Notify(t *testing.T) {
 	req := require.New(t)
-	registry, err := NewEtcdSchemaRegistry(useRandomPort(), useRandomTempDir(), LoggerLevel("warn"))
+	registry, err := NewEtcdSchemaRegistry(useRandomPort(), useRandomTempDir())
 	req.NoError(err)
 	req.NotNil(registry)
 	defer registry.Close()
@@ -388,9 +388,9 @@ func Test_Notify(t *testing.T) {
 	req.NoError(err)
 
 	tests := []struct {
-		name           string
 		testFunc       func(context.Context, Registry) error
 		validationFunc func(*mockedEventHandler) bool
+		name           string
 	}{
 		{
 			name: "modify indexRule",

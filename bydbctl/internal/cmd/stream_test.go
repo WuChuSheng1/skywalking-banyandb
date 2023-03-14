@@ -29,8 +29,8 @@ import (
 	grpclib "google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	database_v1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
-	stream_v1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/stream/v1"
+	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
+	streamv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/stream/v1"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/cmd"
 	"github.com/apache/skywalking-banyandb/pkg/test/flags"
 	"github.com/apache/skywalking-banyandb/pkg/test/helpers"
@@ -44,7 +44,7 @@ var _ = Describe("Stream Schema Operation", func() {
 	var deferFunc func()
 	var rootCmd *cobra.Command
 	BeforeEach(func() {
-		_, addr, deferFunc = setup.SetUp()
+		_, addr, deferFunc = setup.Common()
 		Eventually(helpers.HTTPHealthCheck(addr), flags.EventuallyTimeout).Should(Succeed())
 		addr = "http://" + addr
 		// extracting the operation of creating stream schema
@@ -85,7 +85,9 @@ tagFamilies:
   - name: searchable
     tags: 
       - name: trace_id
-        type: TAG_TYPE_STRING`))
+        type: TAG_TYPE_STRING
+entity:
+  tagNames: ["tag1"]`))
 			return capturer.CaptureStdout(func() {
 				err := rootCmd.Execute()
 				if err != nil {
@@ -103,7 +105,7 @@ tagFamilies:
 			Expect(err).NotTo(HaveOccurred())
 		})
 		GinkgoWriter.Println(out)
-		resp := new(database_v1.StreamRegistryServiceGetResponse)
+		resp := new(databasev1.StreamRegistryServiceGetResponse)
 		helpers.UnmarshalYAML([]byte(out), resp)
 		Expect(resp.Stream.Metadata.Group).To(Equal("group1"))
 		Expect(resp.Stream.Metadata.Name).To(Equal("name1"))
@@ -115,6 +117,11 @@ tagFamilies:
 metadata:
   name: name1
   group: group1
+tagFamilies:
+  - name: searchable
+    tags: 
+      - name: trace_id
+        type: TAG_TYPE_STRING
 entity:
   tagNames: ["tag1"]`))
 		out := capturer.CaptureStdout(func() {
@@ -127,7 +134,7 @@ entity:
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
 		})
-		resp := new(database_v1.StreamRegistryServiceGetResponse)
+		resp := new(databasev1.StreamRegistryServiceGetResponse)
 		helpers.UnmarshalYAML([]byte(out), resp)
 		Expect(resp.Stream.Metadata.Group).To(Equal("group1"))
 		Expect(resp.Stream.Metadata.Name).To(Equal("name1"))
@@ -154,7 +161,14 @@ entity:
 		rootCmd.SetIn(strings.NewReader(`
 metadata:
   name: name2
-  group: group1`))
+  group: group1
+tagFamilies:
+  - name: searchable
+    tags: 
+      - name: trace_id
+        type: TAG_TYPE_STRING
+entity:
+  tagNames: ["tag1"]`))
 		out := capturer.CaptureStdout(func() {
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
@@ -166,7 +180,7 @@ metadata:
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
 		})
-		resp := new(database_v1.StreamRegistryServiceListResponse)
+		resp := new(databasev1.StreamRegistryServiceListResponse)
 		helpers.UnmarshalYAML([]byte(out), resp)
 		Expect(resp.Stream).To(HaveLen(2))
 	})
@@ -188,7 +202,7 @@ var _ = Describe("Stream Data Query", func() {
 		nowStr = now.Format(time.RFC3339)
 		interval = 500 * time.Millisecond
 		endStr = now.Add(1 * time.Hour).Format(time.RFC3339)
-		grpcAddr, addr, deferFunc = setup.SetUp()
+		grpcAddr, addr, deferFunc = setup.Common()
 		Eventually(helpers.HTTPHealthCheck(addr), flags.EventuallyTimeout).Should(Succeed())
 		addr = "http://" + addr
 		rootCmd = &cobra.Command{Use: "root"}
@@ -225,7 +239,7 @@ projection:
 		Eventually(issue, flags.EventuallyTimeout).ShouldNot(ContainSubstring("code:"))
 		Eventually(func() int {
 			out := issue()
-			resp := new(stream_v1.QueryResponse)
+			resp := new(streamv1.QueryResponse)
 			helpers.UnmarshalYAML([]byte(out), resp)
 			GinkgoWriter.Println(resp)
 			return len(resp.Elements)
@@ -263,7 +277,7 @@ projection:
 		Eventually(issue, flags.EventuallyTimeout).ShouldNot(ContainSubstring("code:"))
 		Eventually(func() int {
 			out := issue()
-			resp := new(stream_v1.QueryResponse)
+			resp := new(streamv1.QueryResponse)
 			helpers.UnmarshalYAML([]byte(out), resp)
 			GinkgoWriter.Println(resp)
 			return len(resp.Elements)

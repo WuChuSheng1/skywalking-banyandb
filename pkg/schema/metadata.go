@@ -15,16 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Package schema implements a framework to sync schema info from the metadata repository.
 package schema
 
 import (
 	"context"
 	"io"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/onsi/ginkgo/v2"
 	"github.com/pkg/errors"
 	"go.uber.org/multierr"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -38,38 +39,48 @@ import (
 	"github.com/apache/skywalking-banyandb/pkg/logger"
 	"github.com/apache/skywalking-banyandb/pkg/partition"
 	pbv1 "github.com/apache/skywalking-banyandb/pkg/pb/v1"
+	"github.com/apache/skywalking-banyandb/pkg/run"
 )
 
+// EventType defines actions of events.
 type EventType uint8
 
+// EventType support Add/Update and Delete.
+// All events are idempotent.
 const (
 	EventAddOrUpdate EventType = iota
 	EventDelete
 )
 
+// EventKind defines category of events.
 type EventKind uint8
 
+// This framework groups events to a hierarchy. A group is the root node.
 const (
 	EventKindGroup EventKind = iota
 	EventKindResource
 )
 
+// Group is the root node, allowing get resources from its sub nodes.
 type Group interface {
 	GetSchema() *commonv1.Group
 	StoreResource(resourceSchema ResourceSchema) (Resource, error)
 	LoadResource(name string) (Resource, bool)
 }
 
+// MetadataEvent is the syncing message between metadata repo and this framework.
 type MetadataEvent struct {
+	Metadata *commonv1.Metadata
 	Typ      EventType
 	Kind     EventKind
-	Metadata *commonv1.Metadata
 }
 
+// ResourceSchema allows get the metadata.
 type ResourceSchema interface {
 	GetMetadata() *commonv1.Metadata
 }
 
+// ResourceSpec wraps required fields to open a resource.
 type ResourceSpec struct {
 	Schema ResourceSchema
 	// IndexRules are index rules bound to the Schema
@@ -78,6 +89,7 @@ type ResourceSpec struct {
 	Aggregations []*databasev1.TopNAggregation
 }
 
+// Resource allows access metadata from a local cache.
 type Resource interface {
 	GetIndexRules() []*databasev1.IndexRule
 	MaxObservedModRevision() int64
@@ -86,12 +98,14 @@ type Resource interface {
 	io.Closer
 }
 
+// ResourceSupplier allows open a resource and its embedded tsdb.
 type ResourceSupplier interface {
 	OpenResource(shardNum uint32, db tsdb.Supplier, spec ResourceSpec) (Resource, error)
-	ResourceSchema(repo metadata.Repo, metdata *commonv1.Metadata) (ResourceSchema, error)
+	ResourceSchema(metdata *commonv1.Metadata) (ResourceSchema, error)
 	OpenDB(groupSchema *commonv1.Group) (tsdb.Database, error)
 }
 
+// Repository is the collection of several hierarchies groups by a "Group".
 type Repository interface {
 	Watcher()
 	SendMetadataEvent(MetadataEvent)
@@ -102,23 +116,25 @@ type Repository interface {
 	Close()
 }
 
+const defaultWorkerNum = 10
+
 var _ Repository = (*schemaRepo)(nil)
 
 type schemaRepo struct {
-	sync.RWMutex
 	metadata         metadata.Repo
 	repo             discovery.ServiceRepo
-	l                *logger.Logger
 	resourceSupplier ResourceSupplier
+	l                *logger.Logger
+	data             map[string]*group
+	closer           *run.Closer
+	eventCh          chan MetadataEvent
 	shardTopic       bus.Topic
 	entityTopic      bus.Topic
-	data             map[string]*group
-
-	// stop channel for the inner worker
-	workerStopCh chan struct{}
-	eventCh      chan MetadataEvent
+	workerNum        int
+	sync.RWMutex
 }
 
+// NewRepository return a new Repository.
 func NewRepository(
 	metadata metadata.Repo,
 	repo discovery.ServiceRepo,
@@ -135,8 +151,9 @@ func NewRepository(
 		shardTopic:       shardTopic,
 		entityTopic:      entityTopic,
 		data:             make(map[string]*group),
-		eventCh:          make(chan MetadataEvent),
-		workerStopCh:     make(chan struct{}),
+		eventCh:          make(chan MetadataEvent, defaultWorkerNum),
+		workerNum:        defaultWorkerNum,
+		closer:           run.NewCloser(defaultWorkerNum),
 	}
 }
 
@@ -145,9 +162,10 @@ func (sr *schemaRepo) SendMetadataEvent(event MetadataEvent) {
 }
 
 func (sr *schemaRepo) Watcher() {
-	for i := 0; i < 10; i++ {
+	for i := 0; i < sr.workerNum; i++ {
 		go func() {
 			defer func() {
+				sr.closer.Done()
 				if err := recover(); err != nil {
 					sr.l.Warn().Interface("err", err).Msg("watching the events")
 				}
@@ -161,32 +179,32 @@ func (sr *schemaRepo) Watcher() {
 					if e := sr.l.Debug(); e.Enabled() {
 						e.Interface("event", evt).Msg("received an event")
 					}
-					for i := 0; i < 10; i++ {
-						var err error
-						switch evt.Typ {
-						case EventAddOrUpdate:
-							switch evt.Kind {
-							case EventKindGroup:
-								_, err = sr.StoreGroup(evt.Metadata)
-							case EventKindResource:
-								_, err = sr.storeResource(evt.Metadata)
-							}
-						case EventDelete:
-							switch evt.Kind {
-							case EventKindGroup:
-								err = sr.deleteGroup(evt.Metadata)
-							case EventKindResource:
-								err = sr.deleteResource(evt.Metadata)
-							}
+					var err error
+					switch evt.Typ {
+					case EventAddOrUpdate:
+						switch evt.Kind {
+						case EventKindGroup:
+							_, err = sr.StoreGroup(evt.Metadata)
+						case EventKindResource:
+							_, err = sr.storeResource(evt.Metadata)
 						}
-						if err == nil {
-							break
+					case EventDelete:
+						switch evt.Kind {
+						case EventKindGroup:
+							err = sr.deleteGroup(evt.Metadata)
+						case EventKindResource:
+							err = sr.deleteResource(evt.Metadata)
 						}
-						runtime.Gosched()
-						time.Sleep(time.Second)
-						sr.l.Err(err).Interface("event", evt).Int("round", i).Msg("fail to handle the metadata event. retry...")
 					}
-				case <-sr.workerStopCh:
+					if err != nil {
+						sr.l.Err(err).Interface("event", evt).Msg("fail to handle the metadata event. retry...")
+						select {
+						case sr.eventCh <- evt:
+						case <-sr.closer.CloseNotify():
+							return
+						}
+					}
+				case <-sr.closer.CloseNotify():
 					return
 				}
 			}
@@ -289,7 +307,7 @@ func (sr *schemaRepo) storeResource(metadata *commonv1.Metadata) (Resource, erro
 			return nil, errors.WithMessagef(err, "create unknown group:%s", metadata.Group)
 		}
 	}
-	stm, err := sr.resourceSupplier.ResourceSchema(sr.metadata, metadata)
+	stm, err := sr.resourceSupplier.ResourceSchema(metadata)
 	if err != nil {
 		return nil, errors.WithMessage(err, "fails to get the resource")
 	}
@@ -358,9 +376,7 @@ func (sr *schemaRepo) Close() {
 			sr.l.Warn().Interface("err", err).Msg("closing resource")
 		}
 	}()
-	if sr.workerStopCh != nil {
-		close(sr.workerStopCh)
-	}
+	sr.closer.CloseThenWait()
 
 	sr.RLock()
 	defer sr.RUnlock()
@@ -375,15 +391,15 @@ func (sr *schemaRepo) Close() {
 var _ Group = (*group)(nil)
 
 type group struct {
-	groupSchema      atomic.Pointer[commonv1.Group]
-	l                *logger.Logger
 	resourceSupplier ResourceSupplier
 	repo             discovery.ServiceRepo
 	metadata         metadata.Repo
-	entityTopic      bus.Topic
 	db               atomic.Value
-	mapMutex         sync.RWMutex
+	groupSchema      atomic.Pointer[commonv1.Group]
+	l                *logger.Logger
 	schemaMap        map[string]Resource
+	entityTopic      bus.Topic
+	mapMutex         sync.RWMutex
 }
 
 func newGroup(
@@ -505,6 +521,7 @@ func (g *group) LoadResource(name string) (Resource, bool) {
 }
 
 func (g *group) notify(resource Resource, action databasev1.Action) error {
+	defer ginkgo.GinkgoRecover()
 	now := time.Now()
 	nowPb := timestamppb.New(now)
 	entityLocator := resource.EntityLocator()

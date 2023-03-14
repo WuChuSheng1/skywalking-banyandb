@@ -20,60 +20,107 @@ package logical
 import (
 	"github.com/pkg/errors"
 
-	commonv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/common/v1"
 	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
 	"github.com/apache/skywalking-banyandb/banyand/tsdb"
 )
 
+// IndexChecker allows checking the existence of a specific index rule.
+type IndexChecker interface {
+	IndexDefined(tagName string) (bool, *databasev1.IndexRule)
+	IndexRuleDefined(ruleName string) (bool, *databasev1.IndexRule)
+}
+
+type emptyIndexChecker struct{}
+
+func (emptyIndexChecker) IndexDefined(_ string) (bool, *databasev1.IndexRule) {
+	return false, nil
+}
+
+func (emptyIndexChecker) IndexRuleDefined(_ string) (bool, *databasev1.IndexRule) {
+	return false, nil
+}
+
+// TagSpecRegistry enables to find TagSpec by its name.
+type TagSpecRegistry interface {
+	FindTagSpecByName(string) *TagSpec
+}
+
+// Schema allows retrieving schemas in a convenient way.
 type Schema interface {
+	TagSpecRegistry
+	IndexChecker
 	Scope() tsdb.Entry
 	EntityList() []string
-	IndexDefined(tagName string) (bool, *databasev1.IndexRule)
-	IndexRuleDefined(string) (bool, *databasev1.IndexRule)
 	CreateTagRef(tags ...[]*Tag) ([][]*TagRef, error)
 	CreateFieldRef(fields ...*Field) ([]*FieldRef, error)
 	ProjTags(refs ...[]*TagRef) Schema
 	ProjFields(refs ...*FieldRef) Schema
 	Equal(Schema) bool
-	ShardNumber() uint32
 }
 
+// TagSpec wraps offsets to access a tag in the raw data swiftly.
 type TagSpec struct {
-	// Idx is defined as
-	// 1) the field index based on the (stream/measure) schema for the underlying plans which
-	//    directly interact with the database and index modules,
-	// 2) the projection index given by the users for those plans which can only access the data from parent plans,
-	//    e.g. orderBy plan uses this projection index to access the data entities (normally a projection view)
-	//    from the parent plan.
+	Spec         *databasev1.TagSpec
 	TagFamilyIdx int
 	TagIdx       int
-	Spec         *databasev1.TagSpec
 }
 
+// Equal compares fs and other have the same fields.
 func (fs *TagSpec) Equal(other *TagSpec) bool {
 	return fs.TagFamilyIdx == other.TagFamilyIdx && fs.TagIdx == other.TagIdx &&
 		fs.Spec.GetType() == other.Spec.GetType() && fs.Spec.GetName() == other.Spec.GetName()
 }
 
+// TagSpecMap is a map of TapSpec implements TagSpecRegistry.
+type TagSpecMap map[string]*TagSpec
+
+// FindTagSpecByName finds TagSpec by its name in the registry.
+func (tagSpecMap TagSpecMap) FindTagSpecByName(name string) *TagSpec {
+	if spec, ok := tagSpecMap[name]; ok {
+		return spec
+	}
+	return nil
+}
+
+// RegisterTagFamilies registers the tag specs with a given slice of TagFamilySpec.
+func (tagSpecMap TagSpecMap) RegisterTagFamilies(tagFamilies []*databasev1.TagFamilySpec) {
+	for tagFamilyIdx, tagFamily := range tagFamilies {
+		for tagIdx, spec := range tagFamily.GetTags() {
+			tagSpecMap.RegisterTag(tagFamilyIdx, tagIdx, spec)
+		}
+	}
+}
+
+// RegisterTag registers the tag spec with given tagFamilyName, tagName and indexes.
+func (tagSpecMap TagSpecMap) RegisterTag(tagFamilyIdx, tagIdx int, spec *databasev1.TagSpec) {
+	tagSpecMap[spec.GetName()] = &TagSpec{
+		TagIdx:       tagIdx,
+		TagFamilyIdx: tagFamilyIdx,
+		Spec:         spec,
+	}
+}
+
+// CommonSchema represents a sharable fields between independent schemas.
+// It provides common access methods at the same time.
 type CommonSchema struct {
-	Group      *commonv1.Group
+	TagSpecMap
 	IndexRules []*databasev1.IndexRule
-	TagMap     map[string]*TagSpec
 	EntityList []string
 }
 
+// ProjTags inits a dictionary for getting TagSpec by tag's name.
 func (cs *CommonSchema) ProjTags(refs ...[]*TagRef) *CommonSchema {
 	if len(refs) == 0 {
 		return nil
 	}
 	newCommonSchema := &CommonSchema{
 		IndexRules: cs.IndexRules,
-		TagMap:     make(map[string]*TagSpec),
+		TagSpecMap: make(map[string]*TagSpec),
 		EntityList: cs.EntityList,
 	}
 	for projFamilyIdx, refInFamily := range refs {
 		for projIdx, ref := range refInFamily {
-			newCommonSchema.TagMap[ref.Tag.GetTagName()] = &TagSpec{
+			newCommonSchema.TagSpecMap[ref.Tag.getTagName()] = &TagSpec{
 				TagFamilyIdx: projFamilyIdx,
 				TagIdx:       projIdx,
 				Spec:         ref.Spec.Spec,
@@ -83,20 +130,7 @@ func (cs *CommonSchema) ProjTags(refs ...[]*TagRef) *CommonSchema {
 	return newCommonSchema
 }
 
-// registerTag registers the tag spec with given tagFamilyName, tagName and indexes.
-func (cs *CommonSchema) RegisterTag(tagFamilyIdx, tagIdx int, spec *databasev1.TagSpec) {
-	cs.TagMap[spec.GetName()] = &TagSpec{
-		TagIdx:       tagIdx,
-		TagFamilyIdx: tagFamilyIdx,
-		Spec:         spec,
-	}
-}
-
-func (cs *CommonSchema) ShardNumber() uint32 {
-	return cs.Group.ResourceOpts.ShardNum
-}
-
-// IndexDefined checks whether the field given is indexed
+// IndexDefined checks whether the field given is indexed.
 func (cs *CommonSchema) IndexDefined(tagName string) (bool, *databasev1.IndexRule) {
 	for _, idxRule := range cs.IndexRules {
 		for _, tn := range idxRule.GetTags() {
@@ -108,6 +142,7 @@ func (cs *CommonSchema) IndexDefined(tagName string) (bool, *databasev1.IndexRul
 	return false, nil
 }
 
+// IndexRuleDefined return the IndexRule by its name.
 func (cs *CommonSchema) IndexRuleDefined(indexRuleName string) (bool, *databasev1.IndexRule) {
 	for _, idxRule := range cs.IndexRules {
 		if idxRule.GetMetadata().GetName() == indexRuleName {
@@ -125,10 +160,10 @@ func (cs *CommonSchema) CreateRef(tags ...[]*Tag) ([][]*TagRef, error) {
 	for i, tagInFamily := range tags {
 		var tagRefsInFamily []*TagRef
 		for _, tag := range tagInFamily {
-			if ts, ok := cs.TagMap[tag.GetTagName()]; ok {
+			if ts, ok := cs.TagSpecMap[tag.getTagName()]; ok {
 				tagRefsInFamily = append(tagRefsInFamily, &TagRef{tag, ts})
 			} else {
-				return nil, errors.Wrap(ErrTagNotDefined, tag.GetCompoundName())
+				return nil, errors.Wrap(errTagNotDefined, tag.GetCompoundName())
 			}
 		}
 		tagRefs[i] = tagRefsInFamily

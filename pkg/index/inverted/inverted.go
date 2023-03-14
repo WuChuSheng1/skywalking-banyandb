@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Package inverted implements a inverted index repository.
 package inverted
 
 import (
@@ -27,6 +28,7 @@ import (
 	"github.com/blugelabs/bluge"
 	"github.com/blugelabs/bluge/analysis"
 	"github.com/blugelabs/bluge/analysis/analyzer"
+	blugeIndex "github.com/blugelabs/bluge/index"
 	"github.com/blugelabs/bluge/search"
 	"github.com/dgraph-io/badger/v3/y"
 	"go.uber.org/multierr"
@@ -47,6 +49,12 @@ const (
 	docID         = "_id"
 	batchSize     = 1024
 	seriesIDField = "series_id"
+	idField       = "id"
+)
+
+var (
+	defaultUpper = convert.Uint64ToBytes(math.MaxUint64)
+	defaultLower = convert.Uint64ToBytes(0)
 )
 
 var analyzers map[databasev1.IndexRule_Analyzer]*analysis.Analyzer
@@ -61,9 +69,11 @@ func init() {
 
 var _ index.Store = (*store)(nil)
 
+// StoreOpts wraps options to create a inverted index repository.
 type StoreOpts struct {
-	Path   string
-	Logger *logger.Logger
+	Logger       *logger.Logger
+	Path         string
+	BatchWaitSec int64
 }
 
 type doc struct {
@@ -76,25 +86,37 @@ type flushEvent struct {
 }
 
 type store struct {
-	writer *bluge.Writer
-	ch     chan any
-	closer *run.Closer
-	l      *logger.Logger
+	writer        *bluge.Writer
+	ch            chan any
+	closer        *run.Closer
+	l             *logger.Logger
+	batchInterval time.Duration
 }
 
+// NewStore create a new inverted index repository.
 func NewStore(opts StoreOpts) (index.Store, error) {
-	config := bluge.DefaultConfig(opts.Path)
+	indexConfig := blugeIndex.DefaultConfig(opts.Path).WithUnsafeBatches().
+		WithPersisterNapTimeMSec(60 * 1000)
+	indexConfig.MergePlanOptions.MaxSegmentsPerTier = 1
+	indexConfig.MergePlanOptions.MaxSegmentSize = 500000
+	indexConfig.MergePlanOptions.SegmentsPerMergeTask = 20
+	config := bluge.DefaultConfigWithIndexConfig(indexConfig)
 	config.DefaultSearchAnalyzer = analyzers[databasev1.IndexRule_ANALYZER_KEYWORD]
 	config.Logger = log.New(opts.Logger, opts.Logger.Module(), 0)
 	w, err := bluge.OpenWriter(config)
 	if err != nil {
 		return nil, err
 	}
+	sec := opts.BatchWaitSec
+	if sec < 1 {
+		sec = 1
+	}
 	s := &store{
-		writer: w,
-		l:      opts.Logger,
-		ch:     make(chan any, batchSize),
-		closer: run.NewCloser(1),
+		writer:        w,
+		batchInterval: time.Duration(sec * int64(time.Second)),
+		l:             opts.Logger,
+		ch:            make(chan any, batchSize),
+		closer:        run.NewCloser(1),
 	}
 	s.run()
 	return s, nil
@@ -131,23 +153,42 @@ func (s *store) Iterator(fieldKey index.FieldKey, termRange index.RangeOpts, ord
 	if termRange.Lower != nil &&
 		termRange.Upper != nil &&
 		bytes.Compare(termRange.Lower, termRange.Upper) > 0 {
-		return index.EmptyFieldIterator, nil
+		return index.DummyFieldIterator, nil
+	}
+	if termRange.Upper == nil {
+		termRange.Upper = defaultUpper
+	}
+	if termRange.Lower == nil {
+		termRange.Lower = defaultLower
 	}
 	reader, err := s.writer.Reader()
 	if err != nil {
 		return nil, err
 	}
 	fk := fieldKey.MarshalIndexRule()
-	query := bluge.NewBooleanQuery()
-	query.
-		AddMust(bluge.NewTermQuery(string(fieldKey.SeriesID.Marshal())).SetField(seriesIDField)).
-		AddMust(bluge.NewTermRangeInclusiveQuery(
-			string(termRange.Lower),
-			string(termRange.Upper),
+	var query bluge.Query
+	shouldDecodeTerm := true
+	if fieldKey.Analyzer == databasev1.IndexRule_ANALYZER_UNSPECIFIED {
+		query = bluge.NewTermRangeInclusiveQuery(
+			index.FieldStr(fieldKey, termRange.Lower),
+			index.FieldStr(fieldKey, termRange.Upper),
 			termRange.IncludesLower,
 			termRange.IncludesUpper,
 		).
-			SetField(fk))
+			SetField(fk)
+	} else {
+		shouldDecodeTerm = false
+		query = bluge.NewBooleanQuery().
+			AddMust(bluge.NewTermRangeInclusiveQuery(
+				string(termRange.Lower),
+				string(termRange.Upper),
+				termRange.IncludesLower,
+				termRange.IncludesUpper,
+			).
+				SetField(fk)).
+			AddMust(bluge.NewTermQuery(string(fieldKey.SeriesID.Marshal())).SetField(seriesIDField))
+	}
+
 	sortedKey := fk
 	if order == modelv1.Sort_SORT_DESC {
 		sortedKey = "-" + sortedKey
@@ -156,7 +197,7 @@ func (s *store) Iterator(fieldKey index.FieldKey, termRange index.RangeOpts, ord
 	if err != nil {
 		return nil, err
 	}
-	result := newBlugeMatchIterator(documentMatchIterator, fk)
+	result := newBlugeMatchIterator(documentMatchIterator, fk, shouldDecodeTerm)
 	return &result, nil
 }
 
@@ -170,15 +211,21 @@ func (s *store) MatchTerms(field index.Field) (list posting.List, err error) {
 		return nil, err
 	}
 	fk := field.Key.MarshalIndexRule()
-	query := bluge.NewBooleanQuery()
-	query.
-		AddMust(bluge.NewTermQuery(string(field.Key.SeriesID.Marshal())).SetField(seriesIDField)).
-		AddMust(bluge.NewTermQuery(string(field.Term)).SetField(fk))
+	var query bluge.Query
+	shouldDecodeTerm := true
+	if field.Key.Analyzer == databasev1.IndexRule_ANALYZER_UNSPECIFIED {
+		query = bluge.NewTermQuery(string(field.Marshal())).SetField(fk)
+	} else {
+		shouldDecodeTerm = false
+		query = bluge.NewBooleanQuery().
+			AddMust(bluge.NewTermQuery(string(field.Term)).SetField(fk)).
+			AddMust(bluge.NewTermQuery(string(field.Key.SeriesID.Marshal())).SetField(seriesIDField))
+	}
 	documentMatchIterator, err := reader.Search(context.Background(), bluge.NewAllMatches(query))
 	if err != nil {
 		return nil, err
 	}
-	iter := newBlugeMatchIterator(documentMatchIterator, fk)
+	iter := newBlugeMatchIterator(documentMatchIterator, fk, shouldDecodeTerm)
 	list = roaring.NewPostingList()
 	for iter.Next() {
 		err = multierr.Append(err, list.Union(iter.Val().Value))
@@ -188,28 +235,26 @@ func (s *store) MatchTerms(field index.Field) (list posting.List, err error) {
 }
 
 func (s *store) Match(fieldKey index.FieldKey, matches []string) (posting.List, error) {
-	if len(matches) == 0 {
-		return roaring.EmptyPostingList, nil
+	if len(matches) == 0 || fieldKey.Analyzer == databasev1.IndexRule_ANALYZER_UNSPECIFIED {
+		return roaring.DummyPostingList, nil
 	}
 	reader, err := s.writer.Reader()
 	if err != nil {
 		return nil, err
 	}
+	analyzer := analyzers[fieldKey.Analyzer]
 	fk := fieldKey.MarshalIndexRule()
 	query := bluge.NewBooleanQuery()
 	query.AddMust(bluge.NewTermQuery(string(fieldKey.SeriesID.Marshal())).SetField(seriesIDField))
 	for _, m := range matches {
-		q := bluge.NewMatchQuery(m).SetField(fk)
-		if fieldKey.Analyzer != databasev1.IndexRule_ANALYZER_UNSPECIFIED {
-			q.SetAnalyzer(analyzers[fieldKey.Analyzer])
-		}
-		query.AddMust(q)
+		query.AddMust(bluge.NewMatchQuery(m).SetField(fk).
+			SetAnalyzer(analyzer))
 	}
 	documentMatchIterator, err := reader.Search(context.Background(), bluge.NewAllMatches(query))
 	if err != nil {
 		return nil, err
 	}
-	iter := newBlugeMatchIterator(documentMatchIterator, fk)
+	iter := newBlugeMatchIterator(documentMatchIterator, fk, false)
 	list := roaring.NewPostingList()
 	for iter.Next() {
 		err = multierr.Append(err, list.Union(iter.Val().Value))
@@ -221,7 +266,7 @@ func (s *store) Match(fieldKey index.FieldKey, matches []string) (posting.List, 
 func (s *store) Range(fieldKey index.FieldKey, opts index.RangeOpts) (list posting.List, err error) {
 	iter, err := s.Iterator(fieldKey, opts, modelv1.Sort_SORT_ASC)
 	if err != nil {
-		return roaring.EmptyPostingList, err
+		return roaring.DummyPostingList, err
 	}
 	list = roaring.NewPostingList()
 	for iter.Next() {
@@ -248,8 +293,7 @@ func (s *store) run() {
 		}
 		var docIDBuffer bytes.Buffer
 		for {
-			timer := time.NewTimer(time.Second)
-			docIDBuffer.Reset()
+			timer := time.NewTimer(s.batchInterval)
 			select {
 			case <-s.closer.CloseNotify():
 				return
@@ -264,26 +308,29 @@ func (s *store) run() {
 				case doc:
 					// TODO: generate a segment directly.
 					fk := d.fields[0].Key
+					docIDBuffer.Reset()
 					docIDBuffer.Write(fk.SeriesID.Marshal())
 					docIDBuffer.Write(convert.Uint64ToBytes(uint64(d.itemID)))
 					doc := bluge.NewDocument(docIDBuffer.String())
-
+					toAddSeriesIDField := false
 					for _, f := range d.fields {
-						doc.AddField(bluge.NewKeywordFieldBytes(seriesIDField, f.Key.SeriesID.Marshal()))
-						field := bluge.NewKeywordFieldBytes(f.Key.MarshalIndexRule(), f.Term).StoreValue().Sortable()
-						if f.Key.Analyzer != databasev1.IndexRule_ANALYZER_UNSPECIFIED {
-							field.WithAnalyzer(analyzers[f.Key.Analyzer])
+						if f.Key.Analyzer == databasev1.IndexRule_ANALYZER_UNSPECIFIED {
+							doc.AddField(bluge.NewKeywordFieldBytes(f.Key.MarshalIndexRule(), f.Marshal()).StoreValue().Sortable())
+						} else {
+							toAddSeriesIDField = true
+							doc.AddField(bluge.NewKeywordFieldBytes(f.Key.MarshalIndexRule(), f.Term).StoreValue().Sortable().
+								WithAnalyzer(analyzers[f.Key.Analyzer]))
 						}
-						doc.AddField(field)
+					}
+					if toAddSeriesIDField {
+						doc.AddField(bluge.NewKeywordFieldBytes(seriesIDField, fk.SeriesID.Marshal()))
 					}
 					size++
+					batch.Update(doc.ID(), doc)
 					if size >= batchSize {
 						flush()
-					} else {
-						batch.Update(doc.ID(), doc)
 					}
 				}
-
 			case <-timer.C:
 				flush()
 			}
@@ -305,20 +352,20 @@ func (s *store) flush() {
 }
 
 type blugeMatchIterator struct {
-	delegated search.DocumentMatchIterator
-	fieldKey  string
-
-	current *index.PostingValue
-	agg     *index.PostingValue
-
-	closed bool
-	err    error
+	delegated        search.DocumentMatchIterator
+	err              error
+	current          *index.PostingValue
+	agg              *index.PostingValue
+	fieldKey         string
+	shouldDecodeTerm bool
+	closed           bool
 }
 
-func newBlugeMatchIterator(delegated search.DocumentMatchIterator, fieldKey string) blugeMatchIterator {
+func newBlugeMatchIterator(delegated search.DocumentMatchIterator, fieldKey string, shouldDecodeTerm bool) blugeMatchIterator {
 	return blugeMatchIterator{
-		delegated: delegated,
-		fieldKey:  fieldKey,
+		delegated:        delegated,
+		fieldKey:         fieldKey,
+		shouldDecodeTerm: shouldDecodeTerm,
 	}
 }
 
@@ -326,8 +373,10 @@ func (bmi *blugeMatchIterator) Next() bool {
 	if bmi.err != nil || bmi.closed {
 		return false
 	}
+	//revive:disable:empty-block
 	for bmi.nextTerm() {
 	}
+	//revive:enable:empty-block
 	if bmi.err != nil || bmi.closed {
 		return false
 	}
@@ -360,7 +409,12 @@ func (bmi *blugeMatchIterator) nextTerm() bool {
 			i++
 		}
 		if field == bmi.fieldKey {
-			term = y.Copy(value)
+			v := y.Copy(value)
+			if bmi.shouldDecodeTerm {
+				term = index.UnmarshalTerm(v)
+			} else {
+				term = v
+			}
 			i++
 		}
 		return i < 2

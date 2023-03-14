@@ -36,7 +36,6 @@ import (
 	"github.com/apache/skywalking-banyandb/banyand/kv"
 	"github.com/apache/skywalking-banyandb/banyand/observability"
 	"github.com/apache/skywalking-banyandb/banyand/tsdb/bucket"
-	"github.com/apache/skywalking-banyandb/pkg/encoding"
 	"github.com/apache/skywalking-banyandb/pkg/index"
 	"github.com/apache/skywalking-banyandb/pkg/index/inverted"
 	"github.com/apache/skywalking-banyandb/pkg/index/lsm"
@@ -53,43 +52,47 @@ const (
 	defaultEnqueueTimeout = 500 * time.Millisecond
 )
 
-var ErrBlockClosingInterrupted = errors.New("interrupt to close the block")
+var errBlockClosingInterrupted = errors.New("interrupt to close the block")
 
 type block struct {
-	path       string
-	l          *logger.Logger
-	queue      bucket.Queue
-	suffix     string
-	ref        *atomic.Int32
-	closed     *atomic.Bool
-	deleted    *atomic.Bool
-	lock       sync.RWMutex
-	position   common.Position
-	memSize    int64
-	lsmMemSize int64
-
-	store         kv.TimeSeriesStore
-	invertedIndex index.Store
-	lsmIndex      index.Store
-	closableLst   []io.Closer
-	clock         timestamp.Clock
-	timestamp.TimeRange
+	store    kv.TimeSeriesStore
+	openOpts openOpts
+	queue    bucket.Queue
 	bucket.Reporter
-	segID          SectionID
-	blockID        SectionID
-	segSuffix      string
-	encodingMethod EncodingMethod
+	clock         timestamp.Clock
+	lsmIndex      index.Store
+	invertedIndex index.Store
+	closed        *atomic.Bool
+	l             *logger.Logger
+	deleted       *atomic.Bool
+	ref           *atomic.Int32
+	position      common.Position
+	timestamp.TimeRange
+	segSuffix   string
+	suffix      string
+	path        string
+	closableLst []io.Closer
+	lock        sync.RWMutex
+	segID       SectionID
+	blockID     SectionID
+}
+
+type openOpts struct {
+	store     []kv.TimeSeriesOptions
+	storePath string
+	inverted  inverted.StoreOpts
+	lsm       lsm.StoreOpts
 }
 
 type blockOpts struct {
-	segID     SectionID
-	segSuffix string
-	blockSize IntervalRule
-	timeRange timestamp.TimeRange
-	suffix    string
-	path      string
 	queue     bucket.Queue
 	scheduler *timestamp.Scheduler
+	timeRange timestamp.TimeRange
+	segSuffix string
+	suffix    string
+	path      string
+	blockSize IntervalRule
+	segID     SectionID
 }
 
 func newBlock(ctx context.Context, opts blockOpts) (b *block, err error) {
@@ -130,21 +133,34 @@ func (b *block) options(ctx context.Context) {
 	if o != nil {
 		options = o.(DatabaseOpts)
 	}
-	if options.EncodingMethod.EncoderPool == nil {
-		options.EncodingMethod.EncoderPool = encoding.NewPlainEncoderPool("tsdb", 0)
+	if options.EncodingMethod.EncoderPool != nil && options.EncodingMethod.DecoderPool != nil {
+		b.openOpts.store = append(b.openOpts.store, kv.TSSWithEncoding(options.EncodingMethod.EncoderPool,
+			options.EncodingMethod.DecoderPool, options.EncodingMethod.ChunkSizeInBytes))
 	}
-	if options.EncodingMethod.EncoderPool == nil {
-		options.EncodingMethod.DecoderPool = encoding.NewPlainDecoderPool("tsdb", 0)
+	if options.CompressionMethod.Type == CompressionTypeZSTD {
+		b.openOpts.store = append(b.openOpts.store, kv.TSSWithZSTDCompression(options.CompressionMethod.ChunkSizeInBytes))
 	}
-	b.encodingMethod = options.EncodingMethod
+	var memSize int64
 	if options.BlockMemSize < 1 {
-		b.memSize = defaultMainMemorySize
+		memSize = defaultMainMemorySize
 	} else {
-		b.memSize = options.BlockMemSize
+		memSize = options.BlockMemSize
 	}
-	b.lsmMemSize = b.memSize / 8
-	if b.lsmMemSize < defaultKVMemorySize {
-		b.lsmMemSize = defaultKVMemorySize
+	b.openOpts.store = append(b.openOpts.store, kv.TSSWithMemTableSize(memSize), kv.TSSWithLogger(b.l.Named(componentMain)))
+	b.openOpts.storePath = path.Join(b.path, componentMain)
+	b.openOpts.inverted = inverted.StoreOpts{
+		Path:         path.Join(b.path, componentSecondInvertedIdx),
+		Logger:       b.l.Named(componentSecondInvertedIdx),
+		BatchWaitSec: options.BlockInvertedIndex.BatchWaitSec,
+	}
+	lsmMemSize := memSize / 8
+	if lsmMemSize < defaultKVMemorySize {
+		lsmMemSize = defaultKVMemorySize
+	}
+	b.openOpts.lsm = lsm.StoreOpts{
+		Path:         path.Join(b.path, componentSecondLSMIdx),
+		Logger:       b.l.Named(componentSecondLSMIdx),
+		MemTableSize: lsmMemSize,
 	}
 }
 
@@ -161,27 +177,14 @@ func (b *block) openSafely() (err error) {
 }
 
 func (b *block) open() (err error) {
-	if b.store, err = kv.OpenTimeSeriesStore(
-		0,
-		path.Join(b.path, componentMain),
-		kv.TSSWithEncoding(b.encodingMethod.EncoderPool, b.encodingMethod.DecoderPool),
-		kv.TSSWithLogger(b.l.Named(componentMain)),
-		kv.TSSWithMemTableSize(b.memSize),
-	); err != nil {
+	if b.store, err = kv.OpenTimeSeriesStore(b.openOpts.storePath, b.openOpts.store...); err != nil {
 		return err
 	}
 	b.closableLst = append(b.closableLst, b.store)
-	if b.invertedIndex, err = inverted.NewStore(inverted.StoreOpts{
-		Path:   path.Join(b.path, componentSecondInvertedIdx),
-		Logger: b.l.Named(componentSecondInvertedIdx),
-	}); err != nil {
+	if b.invertedIndex, err = inverted.NewStore(b.openOpts.inverted); err != nil {
 		return err
 	}
-	if b.lsmIndex, err = lsm.NewStore(lsm.StoreOpts{
-		Path:         path.Join(b.path, componentSecondLSMIdx),
-		Logger:       b.l.Named(componentSecondLSMIdx),
-		MemTableSize: b.lsmMemSize,
-	}); err != nil {
+	if b.lsmIndex, err = lsm.NewStore(b.openOpts.lsm); err != nil {
 		return err
 	}
 	b.closableLst = append(b.closableLst, b.invertedIndex, b.lsmIndex)
@@ -190,9 +193,9 @@ func (b *block) open() (err error) {
 	return nil
 }
 
-func (b *block) delegate(ctx context.Context) (BlockDelegate, error) {
+func (b *block) delegate(ctx context.Context) (blockDelegate, error) {
 	if b.deleted.Load() {
-		return nil, errors.WithMessagef(ErrBlockAbsent, "block %s is deleted", b)
+		return nil, errors.WithMessagef(errBlockAbsent, "block %s is deleted", b)
 	}
 	blockID := BlockID{
 		BlockID: b.blockID,
@@ -277,7 +280,7 @@ func (b *block) close(ctx context.Context) (err error) {
 	select {
 	case <-ctx.Done():
 		stopWaiting.Store(true)
-		return errors.Wrapf(ErrBlockClosingInterrupted, "block:%s", b)
+		return errors.Wrapf(errBlockClosingInterrupted, "block:%s", b)
 	case <-ch:
 	}
 	b.closed.Store(true)
@@ -314,7 +317,7 @@ func (b *block) stats() (names []string, stats []observability.Statistics) {
 	return names, stats
 }
 
-type BlockDelegate interface {
+type blockDelegate interface {
 	io.Closer
 	contains(ts time.Time) bool
 	write(key []byte, val []byte, ts time.Time) error
@@ -322,7 +325,6 @@ type BlockDelegate interface {
 	writeLSMIndex(fields []index.Field, id common.ItemID) error
 	writeInvertedIndex(fields []index.Field, id common.ItemID) error
 	dataReader() kv.TimeSeriesReader
-	decoderPool() encoding.SeriesDecoderPool
 	lsmIndexReader() index.Searcher
 	invertedIndexReader() index.Searcher
 	primaryIndexReader() index.FieldIterable
@@ -331,14 +333,10 @@ type BlockDelegate interface {
 	String() string
 }
 
-var _ BlockDelegate = (*bDelegate)(nil)
+var _ blockDelegate = (*bDelegate)(nil)
 
 type bDelegate struct {
 	delegate *block
-}
-
-func (d *bDelegate) decoderPool() encoding.SeriesDecoderPool {
-	return d.delegate.encodingMethod.DecoderPool
 }
 
 func (d *bDelegate) dataReader() kv.TimeSeriesReader {

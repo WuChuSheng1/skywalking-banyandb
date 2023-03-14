@@ -36,10 +36,11 @@ import (
 )
 
 var (
-	ErrEmptyRootPath  = errors.New("root path is empty")
-	ErrStreamNotExist = errors.New("stream doesn't exist")
+	errEmptyRootPath  = errors.New("root path is empty")
+	errStreamNotExist = errors.New("stream doesn't exist")
 )
 
+// Service allows inspecting the stream elements.
 type Service interface {
 	run.PreRunner
 	run.Config
@@ -50,23 +51,21 @@ type Service interface {
 var _ Service = (*service)(nil)
 
 type service struct {
-	root   string
-	dbOpts tsdb.DatabaseOpts
-
 	schemaRepo    schemaRepo
-	writeListener *writeCallback
-	l             *logger.Logger
 	metadata      metadata.Repo
 	pipeline      queue.Queue
 	repo          discovery.ServiceRepo
-	// stop channel for the service
-	stopCh chan struct{}
+	writeListener *writeCallback
+	l             *logger.Logger
+	stopCh        chan struct{}
+	root          string
+	dbOpts        tsdb.DatabaseOpts
 }
 
 func (s *service) Stream(metadata *commonv1.Metadata) (Stream, error) {
 	sm, ok := s.schemaRepo.loadStream(metadata)
 	if !ok {
-		return nil, errors.WithStack(ErrStreamNotExist)
+		return nil, errors.WithStack(errStreamNotExist)
 	}
 	return sm, nil
 }
@@ -77,12 +76,13 @@ func (s *service) FlagSet() *run.FlagSet {
 	flagS.Int64Var(&s.dbOpts.BlockMemSize, "stream-block-mem-size", 8<<20, "block memory size")
 	flagS.Int64Var(&s.dbOpts.SeriesMemSize, "stream-seriesmeta-mem-size", 1<<20, "series metadata memory size")
 	flagS.Int64Var(&s.dbOpts.GlobalIndexMemSize, "stream-global-index-mem-size", 2<<20, "global index memory size")
+	flagS.Int64Var(&s.dbOpts.BlockInvertedIndex.BatchWaitSec, "stream-idx-batch-wait-sec", 1, "index batch wait in second")
 	return flagS
 }
 
 func (s *service) Validate() error {
 	if s.root == "" {
-		return ErrEmptyRootPath
+		return errEmptyRootPath
 	}
 	return nil
 }
@@ -147,7 +147,7 @@ func (s *service) GracefulStop() {
 	}
 }
 
-// NewService returns a new service
+// NewService returns a new service.
 func NewService(_ context.Context, metadata metadata.Repo, repo discovery.ServiceRepo, pipeline queue.Queue) (Service, error) {
 	return &service{
 		metadata: metadata,

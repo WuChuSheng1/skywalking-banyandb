@@ -21,16 +21,18 @@ import (
 	"context"
 	"time"
 
+	"github.com/pkg/errors"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	commonv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/common/v1"
 	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
+	"github.com/apache/skywalking-banyandb/pkg/timestamp"
 )
 
 const (
-	MeasureKeyPrefix = "/measures/"
-	TagTypeID        = "id"
+	measureKeyPrefix = "/measures/"
+	tagTypeID        = "id"
 )
 
 func (e *etcdSchemaRegistry) GetMeasure(ctx context.Context, metadata *commonv1.Metadata) (*databasev1.Measure, error) {
@@ -45,7 +47,7 @@ func (e *etcdSchemaRegistry) ListMeasure(ctx context.Context, opt ListOpt) ([]*d
 	if opt.Group == "" {
 		return nil, BadRequest("group", "group should not be empty")
 	}
-	messages, err := e.listWithPrefix(ctx, listPrefixesForEntity(opt.Group, MeasureKeyPrefix), func() proto.Message {
+	messages, err := e.listWithPrefix(ctx, listPrefixesForEntity(opt.Group, measureKeyPrefix), func() proto.Message {
 		return &databasev1.Measure{}
 	})
 	if err != nil {
@@ -59,6 +61,14 @@ func (e *etcdSchemaRegistry) ListMeasure(ctx context.Context, opt ListOpt) ([]*d
 }
 
 func (e *etcdSchemaRegistry) CreateMeasure(ctx context.Context, measure *databasev1.Measure) error {
+	if measure.UpdatedAt != nil {
+		measure.UpdatedAt = timestamppb.Now()
+	}
+	if measure.GetInterval() != "" {
+		if _, err := timestamp.ParseDuration(measure.GetInterval()); err != nil {
+			return errors.Wrap(err, "interval is malformed")
+		}
+	}
 	if err := e.create(ctx, Metadata{
 		TypeMeta: TypeMeta{
 			Kind:  KindMeasure,
@@ -72,14 +82,14 @@ func (e *etcdSchemaRegistry) CreateMeasure(ctx context.Context, measure *databas
 
 	// Add an index rule for the ID type tag
 	idIndexRuleMetadata := &commonv1.Metadata{
-		Name:  TagTypeID,
+		Name:  tagTypeID,
 		Group: measure.Metadata.Group,
 	}
 	_, err := e.GetIndexRule(ctx, idIndexRuleMetadata)
-	if IsNotFound(err) {
+	if isNotFound(err) {
 		if errIndexRule := e.CreateIndexRule(ctx, &databasev1.IndexRule{
 			Metadata:  idIndexRuleMetadata,
-			Tags:      []string{TagTypeID},
+			Tags:      []string{tagTypeID},
 			Type:      databasev1.IndexRule_TYPE_TREE,
 			Location:  databasev1.IndexRule_LOCATION_SERIES,
 			UpdatedAt: timestamppb.Now(),
@@ -92,17 +102,17 @@ func (e *etcdSchemaRegistry) CreateMeasure(ctx context.Context, measure *databas
 	for _, tfs := range measure.GetTagFamilies() {
 		for _, ts := range tfs.GetTags() {
 			if ts.Type == databasev1.TagType_TAG_TYPE_ID {
-				for _, e := range measure.Entity.TagNames {
+				for _, e := range measure.GetEntity().GetTagNames() {
 					if ts.Name == e {
 						continue
 					}
 				}
 				irb := &databasev1.IndexRuleBinding{
 					Metadata: &commonv1.Metadata{
-						Name:  TagTypeID + "_" + measure.Metadata.Name + "_" + ts.Name,
+						Name:  tagTypeID + "_" + measure.Metadata.Name + "_" + ts.Name,
 						Group: measure.Metadata.Group,
 					},
-					Rules: []string{TagTypeID},
+					Rules: []string{tagTypeID},
 					Subject: &databasev1.Subject{
 						Catalog: commonv1.Catalog_CATALOG_MEASURE,
 						Name:    measure.Metadata.Name,
@@ -115,7 +125,7 @@ func (e *etcdSchemaRegistry) CreateMeasure(ctx context.Context, measure *databas
 				if innerErr == nil {
 					return e.UpdateIndexRuleBinding(ctx, irb)
 				}
-				if IsNotFound(innerErr) {
+				if isNotFound(innerErr) {
 					return e.CreateIndexRuleBinding(ctx, irb)
 				}
 				return innerErr
@@ -126,6 +136,11 @@ func (e *etcdSchemaRegistry) CreateMeasure(ctx context.Context, measure *databas
 }
 
 func (e *etcdSchemaRegistry) UpdateMeasure(ctx context.Context, measure *databasev1.Measure) error {
+	if measure.GetInterval() != "" {
+		if _, err := timestamp.ParseDuration(measure.GetInterval()); err != nil {
+			return errors.Wrap(err, "interval is malformed")
+		}
+	}
 	if err := e.update(ctx, Metadata{
 		TypeMeta: TypeMeta{
 			Kind:  KindMeasure,
@@ -139,14 +154,14 @@ func (e *etcdSchemaRegistry) UpdateMeasure(ctx context.Context, measure *databas
 
 	// Add an index rule for the ID type tag
 	idIndexRuleMetadata := &commonv1.Metadata{
-		Name:  TagTypeID,
+		Name:  tagTypeID,
 		Group: measure.Metadata.Group,
 	}
 	_, err := e.GetIndexRule(ctx, idIndexRuleMetadata)
-	if IsNotFound(err) {
+	if isNotFound(err) {
 		if errIndexRule := e.CreateIndexRule(ctx, &databasev1.IndexRule{
 			Metadata:  idIndexRuleMetadata,
-			Tags:      []string{TagTypeID},
+			Tags:      []string{tagTypeID},
 			Type:      databasev1.IndexRule_TYPE_TREE,
 			Location:  databasev1.IndexRule_LOCATION_SERIES,
 			UpdatedAt: timestamppb.Now(),
@@ -166,10 +181,10 @@ func (e *etcdSchemaRegistry) UpdateMeasure(ctx context.Context, measure *databas
 				}
 				if errIndexRule := e.UpdateIndexRuleBinding(ctx, &databasev1.IndexRuleBinding{
 					Metadata: &commonv1.Metadata{
-						Name:  TagTypeID + "_" + measure.Metadata.Name + "_" + ts.Name,
+						Name:  tagTypeID + "_" + measure.Metadata.Name + "_" + ts.Name,
 						Group: measure.Metadata.Group,
 					},
-					Rules: []string{TagTypeID},
+					Rules: []string{tagTypeID},
 					Subject: &databasev1.Subject{
 						Catalog: commonv1.Catalog_CATALOG_MEASURE,
 						Name:    measure.Metadata.Name,
@@ -214,5 +229,5 @@ func (e *etcdSchemaRegistry) TopNAggregations(ctx context.Context, metadata *com
 }
 
 func formatMeasureKey(metadata *commonv1.Metadata) string {
-	return formatKey(MeasureKeyPrefix, metadata)
+	return formatKey(measureKeyPrefix, metadata)
 }

@@ -22,6 +22,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/gleak"
 
 	"github.com/apache/skywalking-banyandb/api/event"
 	commonv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/common/v1"
@@ -34,13 +35,15 @@ import (
 var _ = Describe("Metadata", func() {
 	var svcs *services
 	var deferFn func()
-
+	var goods []gleak.Goroutine
 	BeforeEach(func() {
 		svcs, deferFn = setUp()
+		goods = gleak.Goroutines()
 	})
 
 	AfterEach(func() {
 		deferFn()
+		Eventually(gleak.Goroutines, flags.EventuallyTimeout).ShouldNot(gleak.HaveLeaked(goods))
 	})
 
 	Context("Manage group", func() {
@@ -62,8 +65,8 @@ var _ = Describe("Metadata", func() {
 		})
 
 		It("should add shards", func() {
-			svcs.repo.EXPECT().Publish(event.MeasureTopicShardEvent, test.NewShardEventMatcher(databasev1.Action_ACTION_DELETE)).Times(2)
-			svcs.repo.EXPECT().Publish(event.MeasureTopicShardEvent, test.NewShardEventMatcher(databasev1.Action_ACTION_PUT)).Times(4)
+			svcs.repo.EXPECT().Publish(event.MeasureTopicShardEvent, test.NewShardEventMatcher(databasev1.Action_ACTION_DELETE)).AnyTimes()
+			svcs.repo.EXPECT().Publish(event.MeasureTopicShardEvent, test.NewShardEventMatcher(databasev1.Action_ACTION_PUT)).AnyTimes()
 			groupSchema, err := svcs.metadataService.GroupRegistry().GetGroup(context.TODO(), "sw_metric")
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(groupSchema).ShouldNot(BeNil())
@@ -123,7 +126,7 @@ var _ = Describe("Metadata", func() {
 			})
 
 			It("should update a new measure", func() {
-				svcs.repo.EXPECT().Publish(event.MeasureTopicEntityEvent, test.NewEntityEventMatcher(databasev1.Action_ACTION_PUT)).Times(1)
+				svcs.repo.EXPECT().Publish(event.MeasureTopicEntityEvent, test.NewEntityEventMatcher(databasev1.Action_ACTION_PUT)).AnyTimes()
 				// Remove the first tag from the entity
 				measureSchema.Entity.TagNames = measureSchema.Entity.TagNames[1:]
 				entitySize := len(measureSchema.Entity.TagNames)

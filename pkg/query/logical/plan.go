@@ -20,117 +20,67 @@ package logical
 import (
 	"fmt"
 
-	streamv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/stream/v1"
-	"github.com/apache/skywalking-banyandb/pkg/query/executor"
+	"github.com/pkg/errors"
+
+	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
+	modelv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/model/v1"
 )
 
-var (
-	_ Plan           = (*Limit)(nil)
-	_ UnresolvedPlan = (*Limit)(nil)
-)
-
+// Parent refers to a parent node in the execution tree(plan).
 type Parent struct {
 	UnresolvedInput UnresolvedPlan
 	Input           Plan
 }
 
-type Limit struct {
-	*Parent
-	LimitNum uint32
+// OrderBy is the sorting operator.
+type OrderBy struct {
+	Index     *databasev1.IndexRule
+	fieldRefs []*TagRef
+	Sort      modelv1.Sort
 }
 
-func (l *Limit) Execute(ec executor.StreamExecutionContext) ([]*streamv1.Element, error) {
-	entities, err := l.Parent.Input.(executor.StreamExecutable).Execute(ec)
+// Equal reports whether o and other has the same sorting order and name.
+func (o *OrderBy) Equal(other interface{}) bool {
+	if otherOrderBy, ok := other.(*OrderBy); ok {
+		if o == nil && otherOrderBy == nil {
+			return true
+		}
+		if o != nil && otherOrderBy == nil || o == nil && otherOrderBy != nil {
+			return false
+		}
+		return o.Sort == otherOrderBy.Sort &&
+			o.Index.GetMetadata().GetName() == otherOrderBy.Index.GetMetadata().GetName()
+	}
+
+	return false
+}
+
+// Strings shows the string represent.
+func (o *OrderBy) String() string {
+	return fmt.Sprintf("OrderBy: %v, sort=%s", o.Index.GetTags(), o.Sort.String())
+}
+
+// ParseOrderBy parses an OrderBy from a Schema.
+func ParseOrderBy(s Schema, indexRuleName string, sort modelv1.Sort) (*OrderBy, error) {
+	if indexRuleName == "" {
+		return &OrderBy{
+			Sort: sort,
+		}, nil
+	}
+
+	defined, indexRule := s.IndexRuleDefined(indexRuleName)
+	if !defined {
+		return nil, errors.Wrap(errIndexNotDefined, indexRuleName)
+	}
+
+	projFieldSpecs, err := s.CreateTagRef(NewTags("", indexRule.GetTags()...))
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(errTagNotDefined, indexRuleName)
 	}
 
-	if len(entities) > int(l.LimitNum) {
-		return entities[:l.LimitNum], nil
-	}
-
-	return entities, nil
-}
-
-func (l *Limit) Analyze(s Schema) (Plan, error) {
-	var err error
-	l.Input, err = l.UnresolvedInput.Analyze(s)
-	if err != nil {
-		return nil, err
-	}
-	return l, nil
-}
-
-func (l *Limit) Schema() Schema {
-	return l.Input.Schema()
-}
-
-func (l *Limit) String() string {
-	return fmt.Sprintf("%s Limit: %d", l.Input.String(), l.LimitNum)
-}
-
-func (l *Limit) Children() []Plan {
-	return []Plan{l.Input}
-}
-
-func NewLimit(input UnresolvedPlan, num uint32) UnresolvedPlan {
-	return &Limit{
-		Parent: &Parent{
-			UnresolvedInput: input,
-		},
-		LimitNum: num,
-	}
-}
-
-var (
-	_ Plan           = (*Offset)(nil)
-	_ UnresolvedPlan = (*Offset)(nil)
-)
-
-type Offset struct {
-	*Parent
-	offsetNum uint32
-}
-
-func (l *Offset) Execute(ec executor.StreamExecutionContext) ([]*streamv1.Element, error) {
-	elements, err := l.Parent.Input.(executor.StreamExecutable).Execute(ec)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(elements) > int(l.offsetNum) {
-		return elements[l.offsetNum:], nil
-	}
-
-	return []*streamv1.Element{}, nil
-}
-
-func (l *Offset) Analyze(s Schema) (Plan, error) {
-	var err error
-	l.Input, err = l.UnresolvedInput.Analyze(s)
-	if err != nil {
-		return nil, err
-	}
-	return l, nil
-}
-
-func (l *Offset) Schema() Schema {
-	return l.Input.Schema()
-}
-
-func (l *Offset) String() string {
-	return fmt.Sprintf("%s Offset: %d", l.Input.String(), l.offsetNum)
-}
-
-func (l *Offset) Children() []Plan {
-	return []Plan{l.Input}
-}
-
-func NewOffset(input UnresolvedPlan, num uint32) UnresolvedPlan {
-	return &Offset{
-		Parent: &Parent{
-			UnresolvedInput: input,
-		},
-		offsetNum: num,
-	}
+	return &OrderBy{
+		Sort:      sort,
+		Index:     indexRule,
+		fieldRefs: projFieldSpecs[0],
+	}, nil
 }

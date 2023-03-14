@@ -41,7 +41,6 @@ func TestStream(t *testing.T) {
 	RunSpecs(t, "Stream Suite")
 }
 
-// BeforeSuite - Init logger
 var _ = BeforeSuite(func() {
 	Expect(logger.Init(logger.Logging{
 		Env:   "dev",
@@ -49,7 +48,6 @@ var _ = BeforeSuite(func() {
 	})).To(Succeed())
 })
 
-// service to preload stream
 type preloadStreamService struct {
 	metaSvc metadata.Service
 }
@@ -74,6 +72,10 @@ func setUp() (*services, func()) {
 	// Init Discovery
 	repo := discovery.NewMockServiceRepo(ctrl)
 	repo.EXPECT().NodeID().AnyTimes()
+	repo.EXPECT().Name().AnyTimes()
+	stopCh := make(chan struct{})
+	repo.EXPECT().Serve().Return(stopCh).Times(1)
+	repo.EXPECT().GracefulStop().Do(func() { close(stopCh) }).Times(1)
 	// Both PreRun and Serve phases send events
 	repo.EXPECT().Publish(event.StreamTopicEntityEvent, test.NewEntityEventMatcher(databasev1.Action_ACTION_PUT)).Times(2 * 1)
 	repo.EXPECT().Publish(event.StreamTopicShardEvent, test.NewShardEventMatcher(databasev1.Action_ACTION_PUT)).Times(2 * 2)
@@ -101,7 +103,7 @@ func setUp() (*services, func()) {
 	listenClientURL, listenPeerURL, err := test.NewEtcdListenUrls()
 	Expect(err).NotTo(HaveOccurred())
 	flags = append(flags, "--etcd-listen-client-url="+listenClientURL, "--etcd-listen-peer-url="+listenPeerURL)
-	moduleDeferFunc := test.SetUpModules(
+	moduleDeferFunc := test.SetupModules(
 		flags,
 		repo,
 		pipeline,

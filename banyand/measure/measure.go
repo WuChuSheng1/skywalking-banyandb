@@ -15,43 +15,68 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Package measure implements a time-series-based storage which is consists of a sequence of data points.
+// Each data point contains tags and fields. They arrive in a fixed interval. A data point could be updated
+// by one with the identical entity(series_id) and timestamp.
 package measure
 
 import (
 	"context"
 	"time"
 
-	"go.uber.org/multierr"
-
 	commonv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/common/v1"
 	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
+	"github.com/apache/skywalking-banyandb/banyand/metadata"
+	"github.com/apache/skywalking-banyandb/banyand/queue"
 	"github.com/apache/skywalking-banyandb/banyand/tsdb"
 	"github.com/apache/skywalking-banyandb/banyand/tsdb/index"
 	"github.com/apache/skywalking-banyandb/pkg/logger"
 	"github.com/apache/skywalking-banyandb/pkg/partition"
 	pbv1 "github.com/apache/skywalking-banyandb/pkg/pb/v1"
+	"github.com/apache/skywalking-banyandb/pkg/query/logical"
 	"github.com/apache/skywalking-banyandb/pkg/timestamp"
 )
 
 const (
 	plainChunkSize = 1 << 20
-	intChunkSize   = 120
+	intChunkNum    = 120
+	intChunkSize   = 4 * 1024
 )
 
 type measure struct {
-	name     string
-	group    string
-	shardNum uint32
-	l        *logger.Logger
-	schema   *databasev1.Measure
-	// maxObservedModRevision is the max observed revision of index rules in the spec
-	maxObservedModRevision int64
 	databaseSupplier       tsdb.Supplier
+	l                      *logger.Logger
+	schema                 *databasev1.Measure
+	indexWriter            *index.Writer
+	processorManager       *topNProcessorManager
+	name                   string
+	group                  string
 	entityLocator          partition.EntityLocator
 	indexRules             []*databasev1.IndexRule
-	indexWriter            *index.Writer
+	topNAggregations       []*databasev1.TopNAggregation
+	maxObservedModRevision int64
 	interval               time.Duration
-	processorManager       *topNProcessorManager
+	shardNum               uint32
+}
+
+func (s *measure) startSteamingManager(pipeline queue.Queue, repo metadata.Repo) error {
+	if len(s.topNAggregations) == 0 {
+		return nil
+	}
+	tagMapSpec := logical.TagSpecMap{}
+	tagMapSpec.RegisterTagFamilies(s.schema.GetTagFamilies())
+
+	s.processorManager = &topNProcessorManager{
+		l:            s.l,
+		pipeline:     pipeline,
+		repo:         repo,
+		m:            s,
+		s:            tagMapSpec,
+		topNSchemas:  s.topNAggregations,
+		processorMap: make(map[*commonv1.Metadata][]*topNStreamingProcessor),
+	}
+
+	return s.processorManager.start()
 }
 
 func (s *measure) GetSchema() *databasev1.Measure {
@@ -75,7 +100,10 @@ func (s *measure) EntityLocator() partition.EntityLocator {
 }
 
 func (s *measure) Close() error {
-	return multierr.Combine(s.processorManager.Close(), s.indexWriter.Close())
+	if s.processorManager == nil {
+		return nil
+	}
+	return s.processorManager.Close()
 }
 
 func (s *measure) parseSpec() (err error) {
@@ -96,10 +124,11 @@ type measureSpec struct {
 
 func openMeasure(shardNum uint32, db tsdb.Supplier, spec measureSpec, l *logger.Logger) (*measure, error) {
 	m := &measure{
-		shardNum:   shardNum,
-		schema:     spec.schema,
-		indexRules: spec.indexRules,
-		l:          l,
+		shardNum:         shardNum,
+		schema:           spec.schema,
+		indexRules:       spec.indexRules,
+		topNAggregations: spec.topNAggregations,
+		l:                l,
 	}
 	if err := m.parseSpec(); err != nil {
 		return nil, err
@@ -113,18 +142,6 @@ func openMeasure(shardNum uint32, db tsdb.Supplier, spec measureSpec, l *logger.
 		Families:   spec.schema.TagFamilies,
 		IndexRules: spec.indexRules,
 	})
-
-	m.processorManager = &topNProcessorManager{
-		l:            l,
-		m:            m,
-		topNSchemas:  spec.topNAggregations,
-		processorMap: make(map[*commonv1.Metadata][]*topNStreamingProcessor),
-	}
-
-	err := m.processorManager.start()
-	if err != nil {
-		return nil, err
-	}
 
 	return m, nil
 }

@@ -35,13 +35,15 @@ import (
 	resourceSchema "github.com/apache/skywalking-banyandb/pkg/schema"
 )
 
-var ErrTagFamilyNotExist = errors.New("tag family doesn't exist")
+var errTagFamilyNotExist = errors.New("tag family doesn't exist")
 
+// Query allow to retrieve measure data points.
 type Query interface {
 	LoadGroup(name string) (resourceSchema.Group, bool)
 	Measure(measure *commonv1.Metadata) (Measure, error)
 }
 
+// Measure allows inspecting measure data points' details.
 type Measure interface {
 	io.Closer
 	Shards(entity tsdb.Entity) ([]tsdb.Shard, error)
@@ -116,11 +118,7 @@ func (s *measure) ParseTagFamily(family string, item tsdb.Item) (*modelv1.TagFam
 	fid := familyIdentity(family, pbv1.TagFlag)
 	familyRawBytes, err := item.Family(fid)
 	if err != nil {
-		item.PrintContext(s.l.Named("tag-family"), fid, 10)
 		return nil, errors.Wrapf(err, "measure %s.%s parse family %s", s.name, s.group, family)
-	}
-	if len(familyRawBytes) < 1 {
-		item.PrintContext(s.l.Named("tag-family"), fid, 10)
 	}
 	tagFamily := &modelv1.TagFamilyForWrite{}
 	err = proto.Unmarshal(familyRawBytes, tagFamily)
@@ -135,7 +133,7 @@ func (s *measure) ParseTagFamily(family string, item tsdb.Item) (*modelv1.TagFam
 		}
 	}
 	if tagSpec == nil {
-		return nil, ErrTagFamilyNotExist
+		return nil, errTagFamilyNotExist
 	}
 	for i, tag := range tagFamily.GetTags() {
 		tags[i] = &modelv1.Tag{
@@ -162,11 +160,7 @@ func (s *measure) ParseField(name string, item tsdb.Item) (*measurev1.DataPoint_
 	fid := familyIdentity(name, pbv1.EncoderFieldFlag(fieldSpec, s.interval))
 	bytes, err := item.Family(fid)
 	if err != nil {
-		item.PrintContext(s.l.Named("field"), fid, 10)
 		return nil, errors.Wrapf(err, "measure %s.%s parse field %s", s.name, s.group, name)
-	}
-	if len(bytes) < 1 {
-		item.PrintContext(s.l.Named("field"), fid, 10)
 	}
 	fieldValue, err := pbv1.DecodeFieldValue(bytes, fieldSpec)
 	if err != nil {

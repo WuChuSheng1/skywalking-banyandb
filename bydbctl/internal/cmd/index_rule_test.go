@@ -25,7 +25,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/zenizh/go-capturer"
 
-	database_v1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
+	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/cmd"
 	"github.com/apache/skywalking-banyandb/pkg/test/flags"
 	"github.com/apache/skywalking-banyandb/pkg/test/helpers"
@@ -37,7 +37,7 @@ var _ = Describe("IndexRuleSchema Operation", func() {
 	var deferFunc func()
 	var rootCmd *cobra.Command
 	BeforeEach(func() {
-		_, addr, deferFunc = setup.SetUp()
+		_, addr, deferFunc = setup.Common()
 		Eventually(helpers.HTTPHealthCheck(addr), flags.EventuallyTimeout).Should(Succeed())
 		addr = "http://" + addr
 		// extracting the operation of creating indexRule schema
@@ -73,7 +73,10 @@ resource_opts:
 			rootCmd.SetIn(strings.NewReader(`
 metadata:
   name: name1
-  group: group1`))
+  group: group1
+tags: ["layer"]
+type: TYPE_INVERTED
+location: LOCATION_SERIES`))
 			return capturer.CaptureStdout(func() {
 				err := rootCmd.Execute()
 				if err != nil {
@@ -91,7 +94,7 @@ metadata:
 			Expect(err).NotTo(HaveOccurred())
 		})
 		GinkgoWriter.Println(out)
-		resp := new(database_v1.IndexRuleRegistryServiceGetResponse)
+		resp := new(databasev1.IndexRuleRegistryServiceGetResponse)
 		helpers.UnmarshalYAML([]byte(out), resp)
 		Expect(resp.IndexRule.Metadata.Group).To(Equal("group1"))
 		Expect(resp.IndexRule.Metadata.Name).To(Equal("name1"))
@@ -102,7 +105,10 @@ metadata:
 		rootCmd.SetIn(strings.NewReader(`
 metadata:
   name: name1
-  group: group1`))
+  group: group1
+tags: ["layer"]
+type: TYPE_INVERTED
+location: LOCATION_SERIES`))
 		out := capturer.CaptureStdout(func() {
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
@@ -113,7 +119,7 @@ metadata:
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
 		})
-		resp := new(database_v1.IndexRuleRegistryServiceGetResponse)
+		resp := new(databasev1.IndexRuleRegistryServiceGetResponse)
 		helpers.UnmarshalYAML([]byte(out), resp)
 		Expect(resp.IndexRule.Metadata.Group).To(Equal("group1"))
 		Expect(resp.IndexRule.Metadata.Name).To(Equal("name1"))
@@ -139,7 +145,10 @@ metadata:
 		rootCmd.SetIn(strings.NewReader(`
 metadata:
   name: name2
-  group: group1`))
+  group: group1
+tags: ["layer"]
+type: TYPE_INVERTED
+location: LOCATION_SERIES`))
 		out := capturer.CaptureStdout(func() {
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
@@ -151,7 +160,7 @@ metadata:
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
 		})
-		resp := new(database_v1.IndexRuleRegistryServiceListResponse)
+		resp := new(databasev1.IndexRuleRegistryServiceListResponse)
 		helpers.UnmarshalYAML([]byte(out), resp)
 		Expect(resp.IndexRule).To(HaveLen(2))
 	})

@@ -29,8 +29,8 @@ import (
 	grpclib "google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	database_v1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
-	measure_v1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/measure/v1"
+	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
+	measurev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/measure/v1"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/cmd"
 	"github.com/apache/skywalking-banyandb/pkg/test/flags"
 	"github.com/apache/skywalking-banyandb/pkg/test/helpers"
@@ -44,7 +44,7 @@ var _ = Describe("Measure Schema Operation", func() {
 	var deferFunc func()
 	var rootCmd *cobra.Command
 	BeforeEach(func() {
-		_, addr, deferFunc = setup.SetUp()
+		_, addr, deferFunc = setup.Common()
 		Eventually(helpers.HTTPHealthCheck(addr), flags.EventuallyTimeout).Should(Succeed())
 		addr = "http://" + addr
 		// extracting the operation of creating measure schema
@@ -80,7 +80,14 @@ resource_opts:
 			rootCmd.SetIn(strings.NewReader(`
 metadata:
   name: name1
-  group: group1`))
+  group: group1
+tag_families:
+  - name: default
+    tags:
+      - name: id
+        type: TAG_TYPE_ID
+entity:
+  tagNames: ["tag1"]`))
 			return capturer.CaptureStdout(func() {
 				err := rootCmd.Execute()
 				if err != nil {
@@ -97,7 +104,7 @@ metadata:
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
 		})
-		resp := new(database_v1.MeasureRegistryServiceGetResponse)
+		resp := new(databasev1.MeasureRegistryServiceGetResponse)
 		helpers.UnmarshalYAML([]byte(out), resp)
 		Expect(resp.Measure.Metadata.Group).To(Equal("group1"))
 		Expect(resp.Measure.Metadata.Name).To(Equal("name1"))
@@ -109,6 +116,11 @@ metadata:
 metadata:
   name: name1
   group: group1
+tag_families:
+  - name: default
+    tags:
+      - name: id
+        type: TAG_TYPE_ID
 entity:
   tagNames: ["tag1"]`))
 		out := capturer.CaptureStdout(func() {
@@ -121,7 +133,7 @@ entity:
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
 		})
-		resp := new(database_v1.MeasureRegistryServiceGetResponse)
+		resp := new(databasev1.MeasureRegistryServiceGetResponse)
 		helpers.UnmarshalYAML([]byte(out), resp)
 		Expect(resp.Measure.Metadata.Group).To(Equal("group1"))
 		Expect(resp.Measure.Metadata.Name).To(Equal("name1"))
@@ -148,7 +160,14 @@ entity:
 		rootCmd.SetIn(strings.NewReader(`
 metadata:
   name: name2
-  group: group1`))
+  group: group1
+tag_families:
+  - name: default
+    tags:
+      - name: id
+        type: TAG_TYPE_ID
+entity:
+  tagNames: ["tag1"]`))
 		out := capturer.CaptureStdout(func() {
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
@@ -160,7 +179,7 @@ metadata:
 			err := rootCmd.Execute()
 			Expect(err).NotTo(HaveOccurred())
 		})
-		resp := new(database_v1.MeasureRegistryServiceListResponse)
+		resp := new(databasev1.MeasureRegistryServiceListResponse)
 		helpers.UnmarshalYAML([]byte(out), resp)
 		Expect(resp.Measure).To(HaveLen(2))
 	})
@@ -182,7 +201,7 @@ var _ = Describe("Measure Data Query", func() {
 		startStr = now.Add(-20 * time.Minute).Format(time.RFC3339)
 		interval = 1 * time.Millisecond
 		endStr = now.Add(5 * time.Minute).Format(time.RFC3339)
-		grpcAddr, addr, deferFunc = setup.SetUp()
+		grpcAddr, addr, deferFunc = setup.Common()
 		Eventually(helpers.HTTPHealthCheck(addr), flags.EventuallyTimeout).Should(Succeed())
 		addr = "http://" + addr
 		rootCmd = &cobra.Command{Use: "root"}
@@ -219,7 +238,7 @@ tagProjection:
 		Eventually(func() int {
 			out := issue()
 			GinkgoWriter.Println(out)
-			resp := new(measure_v1.QueryResponse)
+			resp := new(measurev1.QueryResponse)
 			helpers.UnmarshalYAML([]byte(out), resp)
 			GinkgoWriter.Println(resp)
 			return len(resp.DataPoints)
@@ -257,7 +276,7 @@ tagProjection:
 		Eventually(issue, flags.EventuallyTimeout).ShouldNot(ContainSubstring("code:"))
 		Eventually(func() int {
 			out := issue()
-			resp := new(measure_v1.QueryResponse)
+			resp := new(measurev1.QueryResponse)
 			helpers.UnmarshalYAML([]byte(out), resp)
 			GinkgoWriter.Println(resp)
 			return len(resp.DataPoints)

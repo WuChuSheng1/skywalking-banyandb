@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Package metadata implements a Raft-based distributed metadata storage system.
+// Powered by etcd.
 package metadata
 
 import (
@@ -27,11 +29,10 @@ import (
 	commonv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/common/v1"
 	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
 	"github.com/apache/skywalking-banyandb/banyand/metadata/schema"
-	"github.com/apache/skywalking-banyandb/pkg/logger"
 	"github.com/apache/skywalking-banyandb/pkg/run"
 )
 
-// IndexFilter provides methods to find a specific index related objects and vice versa
+// IndexFilter provides methods to find a specific index related objects and vice versa.
 type IndexFilter interface {
 	// IndexRules fetches v1.IndexRule by subject defined in IndexRuleBinding
 	IndexRules(ctx context.Context, subject *commonv1.Metadata) ([]*databasev1.IndexRule, error)
@@ -39,6 +40,7 @@ type IndexFilter interface {
 	Subjects(ctx context.Context, indexRule *databasev1.IndexRule, catalog commonv1.Catalog) ([]schema.Spec, error)
 }
 
+// Repo is the facade to interact with the metadata repository.
 type Repo interface {
 	IndexFilter
 	StreamRegistry() schema.Stream
@@ -50,6 +52,7 @@ type Repo interface {
 	PropertyRegistry() schema.Property
 }
 
+// Service is the metadata repository.
 type Service interface {
 	Repo
 	run.PreRunner
@@ -84,7 +87,7 @@ func (s *service) PreRun() error {
 	var err error
 	s.schemaRegistry, err = schema.NewEtcdSchemaRegistry(
 		schema.ConfigureListener(s.listenClientURL, s.listenPeerURL),
-		schema.RootDir(s.rootDir), schema.LoggerLevel(logger.GetLogger().GetLevel().String()))
+		schema.RootDir(s.rootDir))
 	if err != nil {
 		return err
 	}
@@ -101,6 +104,7 @@ func (s *service) GracefulStop() {
 	<-s.schemaRegistry.StopNotify()
 }
 
+// NewService returns a new metadata repository Service.
 func NewService(_ context.Context) (Service, error) {
 	return &service{}, nil
 }
@@ -171,7 +175,6 @@ func (s *service) IndexRules(ctx context.Context, subject *commonv1.Metadata) ([
 			continue
 		}
 		result = append(result, r)
-
 	}
 	return result, indexRuleErr
 }
@@ -201,7 +204,7 @@ func (s *service) Subjects(ctx context.Context, indexRule *databasev1.IndexRule,
 
 		switch catalog {
 		case commonv1.Catalog_CATALOG_STREAM:
-			stream, getErr := s.schemaRegistry.GetStream(context.TODO(), &commonv1.Metadata{
+			stream, getErr := s.schemaRegistry.GetStream(ctx, &commonv1.Metadata{
 				Name:  sub.GetName(),
 				Group: indexRule.GetMetadata().GetGroup(),
 			})
@@ -210,7 +213,7 @@ func (s *service) Subjects(ctx context.Context, indexRule *databasev1.IndexRule,
 			}
 			foundSubjects = append(foundSubjects, stream)
 		case commonv1.Catalog_CATALOG_MEASURE:
-			measure, getErr := s.schemaRegistry.GetMeasure(context.TODO(), &commonv1.Metadata{
+			measure, getErr := s.schemaRegistry.GetMeasure(ctx, &commonv1.Metadata{
 				Name:  sub.GetName(),
 				Group: indexRule.GetMetadata().GetGroup(),
 			})
@@ -218,6 +221,8 @@ func (s *service) Subjects(ctx context.Context, indexRule *databasev1.IndexRule,
 				subjectErr = multierr.Append(subjectErr, getErr)
 			}
 			foundSubjects = append(foundSubjects, measure)
+		default:
+			continue
 		}
 	}
 

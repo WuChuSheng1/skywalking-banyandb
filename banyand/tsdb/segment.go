@@ -32,20 +32,19 @@ import (
 	"github.com/apache/skywalking-banyandb/pkg/timestamp"
 )
 
-var ErrEndOfSegment = errors.New("reached the end of the segment")
+var errEndOfSegment = errors.New("reached the end of the segment")
 
 type segment struct {
-	id     SectionID
-	path   string
-	suffix string
-
 	globalIndex kv.Store
-	l           *logger.Logger
-	timestamp.TimeRange
 	bucket.Reporter
+	l                   *logger.Logger
 	blockController     *blockController
 	blockManageStrategy *bucket.Strategy
-	closeOnce           sync.Once
+	timestamp.TimeRange
+	path      string
+	suffix    string
+	closeOnce sync.Once
+	id        SectionID
 }
 
 func openSegment(ctx context.Context, startTime, endTime time.Time, path, suffix string,
@@ -87,7 +86,6 @@ func openSegment(ctx context.Context, startTime, endTime time.Time, path, suffix
 				memSize = defaultKVMemorySize
 			}
 			if s.globalIndex, err = kv.OpenStore(
-				0,
 				indexPath,
 				kv.StoreWithLogger(s.l),
 				kv.StoreWithMemTableSize(memSize),

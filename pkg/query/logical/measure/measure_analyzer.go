@@ -22,61 +22,38 @@ import (
 
 	commonv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/common/v1"
 	measurev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/measure/v1"
-	"github.com/apache/skywalking-banyandb/banyand/metadata"
-	"github.com/apache/skywalking-banyandb/banyand/tsdb"
+	"github.com/apache/skywalking-banyandb/banyand/measure"
 	"github.com/apache/skywalking-banyandb/pkg/query/logical"
 )
 
-type Analyzer struct {
-	metadataRepoImpl metadata.Repo
-}
+const defaultLimit uint32 = 100
 
-func CreateAnalyzerFromMetaService(metaSvc metadata.Service) (*Analyzer, error) {
-	return &Analyzer{
-		metaSvc,
-	}, nil
-}
-
-func (a *Analyzer) BuildSchema(ctx context.Context, metadata *commonv1.Metadata) (logical.Schema, error) {
-	group, err := a.metadataRepoImpl.GroupRegistry().GetGroup(ctx, metadata.GetGroup())
-	if err != nil {
-		return nil, err
-	}
-	measure, err := a.metadataRepoImpl.MeasureRegistry().GetMeasure(ctx, metadata)
-	if err != nil {
-		return nil, err
-	}
-
-	indexRules, err := a.metadataRepoImpl.IndexRules(context.TODO(), metadata)
-	if err != nil {
-		return nil, err
-	}
+// BuildSchema returns Schema loaded from the metadata repository.
+func BuildSchema(measureSchema measure.Measure) (logical.Schema, error) {
+	md := measureSchema.GetSchema()
+	md.GetEntity()
 
 	ms := &schema{
 		common: &logical.CommonSchema{
-			Group:      group,
-			IndexRules: indexRules,
-			TagMap:     make(map[string]*logical.TagSpec),
-			EntityList: measure.GetEntity().GetTagNames(),
+			IndexRules: measureSchema.GetIndexRules(),
+			TagSpecMap: make(map[string]*logical.TagSpec),
+			EntityList: md.GetEntity().GetTagNames(),
 		},
-		measure:  measure,
+		measure:  md,
 		fieldMap: make(map[string]*logical.FieldSpec),
 	}
 
-	for tagFamilyIdx, tagFamily := range measure.GetTagFamilies() {
-		for tagIdx, spec := range tagFamily.GetTags() {
-			ms.registerTag(tagFamilyIdx, tagIdx, spec)
-		}
-	}
+	ms.common.RegisterTagFamilies(md.GetTagFamilies())
 
-	for fieldIdx, spec := range measure.GetFields() {
+	for fieldIdx, spec := range md.GetFields() {
 		ms.registerField(fieldIdx, spec)
 	}
 
 	return ms, nil
 }
 
-func (a *Analyzer) Analyze(_ context.Context, criteria *measurev1.QueryRequest, metadata *commonv1.Metadata, s logical.Schema) (logical.Plan, error) {
+// Analyze converts logical expressions to executable operation tree represented by Plan.
+func Analyze(_ context.Context, criteria *measurev1.QueryRequest, metadata *commonv1.Metadata, s logical.Schema) (logical.Plan, error) {
 	groupByEntity := false
 	var groupByTags [][]*logical.Tag
 	if criteria.GetGroupBy() != nil {
@@ -93,17 +70,14 @@ func (a *Analyzer) Analyze(_ context.Context, criteria *measurev1.QueryRequest, 
 	}
 
 	// parse fields
-	plan, err := parseFields(criteria, metadata, s, groupByEntity)
-	if err != nil {
-		return nil, err
-	}
+	plan := parseFields(criteria, metadata, groupByEntity)
 
 	if criteria.GetGroupBy() != nil {
-		plan = GroupBy(plan, groupByTags, groupByEntity)
+		plan = newUnresolvedGroupBy(plan, groupByTags, groupByEntity)
 	}
 
 	if criteria.GetAgg() != nil {
-		plan = Aggregation(plan,
+		plan = newUnresolvedAggregation(plan,
 			logical.NewField(criteria.GetAgg().GetFieldName()),
 			criteria.GetAgg().GetFunction(),
 			criteria.GetGroupBy() != nil,
@@ -111,60 +85,39 @@ func (a *Analyzer) Analyze(_ context.Context, criteria *measurev1.QueryRequest, 
 	}
 
 	if criteria.GetTop() != nil {
-		plan = Top(plan, criteria.GetTop())
+		plan = top(plan, criteria.GetTop())
 	}
 
 	// parse limit and offset
 	limitParameter := criteria.GetLimit()
 	if limitParameter == 0 {
-		limitParameter = logical.DefaultLimit
+		limitParameter = defaultLimit
 	}
-	plan = Limit(plan, criteria.GetOffset(), limitParameter)
-
-	return plan.Analyze(s)
+	plan = limit(plan, criteria.GetOffset(), limitParameter)
+	p, err := plan.Analyze(s)
+	if err != nil {
+		return nil, err
+	}
+	rules := []logical.OptimizeRule{
+		logical.NewPushDownOrder(criteria.OrderBy),
+		logical.NewPushDownMaxSize(int(limitParameter + criteria.GetOffset())),
+	}
+	if err := logical.ApplyRules(p, rules...); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 // parseFields parses the query request to decide which kind of plan should be generated
 // Basically,
 // 1 - If no criteria is given, we can only scan all shards
-// 2 - If criteria is given, but all of those fields exist in the "entity" definition
-func parseFields(criteria *measurev1.QueryRequest, metadata *commonv1.Metadata, s logical.Schema, groupByEntity bool) (logical.UnresolvedPlan, error) {
-	timeRange := criteria.GetTimeRange()
-
-	projTags := make([][]*logical.Tag, len(criteria.GetTagProjection().GetTagFamilies()))
-	for i, tagFamily := range criteria.GetTagProjection().GetTagFamilies() {
-		var projTagInFamily []*logical.Tag
-		for _, tagName := range tagFamily.GetTags() {
-			projTagInFamily = append(projTagInFamily, logical.NewTag(tagFamily.GetName(), tagName))
-		}
-		projTags[i] = projTagInFamily
-	}
-
+// 2 - If criteria is given, but all of those fields exist in the "entity" definition.
+func parseFields(criteria *measurev1.QueryRequest, metadata *commonv1.Metadata, groupByEntity bool) logical.UnresolvedPlan {
 	projFields := make([]*logical.Field, len(criteria.GetFieldProjection().GetNames()))
 	for i, fieldNameProj := range criteria.GetFieldProjection().GetNames() {
 		projFields[i] = logical.NewField(fieldNameProj)
 	}
-
-	entityList := s.EntityList()
-	entityMap := make(map[string]int)
-	entity := make([]tsdb.Entry, len(entityList))
-	for idx, e := range entityList {
-		entityMap[e] = idx
-		// fill AnyEntry by default
-		entity[idx] = tsdb.AnyEntry
-	}
-	filter, entities, err := logical.BuildLocalFilter(criteria.GetCriteria(), s, entityMap, entity)
-	if err != nil {
-		return nil, err
-	}
-
-	// parse orderBy
-	queryOrder := criteria.GetOrderBy()
-	var unresolvedOrderBy *logical.UnresolvedOrderBy
-	if queryOrder != nil {
-		unresolvedOrderBy = logical.NewOrderBy(queryOrder.GetIndexRuleName(), queryOrder.GetSort())
-	}
-
-	return IndexScan(timeRange.GetBegin().AsTime(), timeRange.GetEnd().AsTime(), metadata,
-		filter, entities, projTags, projFields, groupByEntity, unresolvedOrderBy), nil
+	timeRange := criteria.GetTimeRange()
+	return indexScan(timeRange.GetBegin().AsTime(), timeRange.GetEnd().AsTime(), metadata,
+		logical.ToTags(criteria.GetTagProjection()), projFields, groupByEntity, criteria.GetCriteria())
 }

@@ -19,84 +19,174 @@ package stream
 
 import (
 	"context"
+	"fmt"
 
 	commonv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/common/v1"
 	streamv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/stream/v1"
-	"github.com/apache/skywalking-banyandb/banyand/metadata"
+	"github.com/apache/skywalking-banyandb/banyand/stream"
+	"github.com/apache/skywalking-banyandb/pkg/query/executor"
 	"github.com/apache/skywalking-banyandb/pkg/query/logical"
 )
 
-type Analyzer struct {
-	metadataRepoImpl metadata.Repo
-}
+const defaultLimit uint32 = 20
 
-func CreateAnalyzerFromMetaService(metaSvc metadata.Service) (*Analyzer, error) {
-	return &Analyzer{
-		metaSvc,
-	}, nil
-}
-
-func (a *Analyzer) BuildSchema(ctx context.Context, metadata *commonv1.Metadata) (logical.Schema, error) {
-	group, err := a.metadataRepoImpl.GroupRegistry().GetGroup(ctx, metadata.GetGroup())
-	if err != nil {
-		return nil, err
-	}
-	stream, err := a.metadataRepoImpl.StreamRegistry().GetStream(ctx, metadata)
-	if err != nil {
-		return nil, err
-	}
-
-	indexRules, err := a.metadataRepoImpl.IndexRules(context.TODO(), metadata)
-	if err != nil {
-		return nil, err
-	}
+// BuildSchema returns Schema loaded from the metadata repository.
+func BuildSchema(streamSchema stream.Stream) (logical.Schema, error) {
+	sm := streamSchema.GetSchema()
 
 	s := &schema{
 		common: &logical.CommonSchema{
-			Group:      group,
-			IndexRules: indexRules,
-			TagMap:     make(map[string]*logical.TagSpec),
-			EntityList: stream.GetEntity().GetTagNames(),
+			IndexRules: streamSchema.GetIndexRules(),
+			TagSpecMap: make(map[string]*logical.TagSpec),
+			EntityList: sm.GetEntity().GetTagNames(),
 		},
-		stream: stream,
+		stream: sm,
 	}
 
-	// generate the streamSchema of the fields for the traceSeries
-	for tagFamilyIdx, tagFamily := range stream.GetTagFamilies() {
-		for tagIdx, spec := range tagFamily.GetTags() {
-			s.registerTag(tagFamilyIdx, tagIdx, spec)
-		}
-	}
+	s.common.RegisterTagFamilies(sm.GetTagFamilies())
 
 	return s, nil
 }
 
-func (a *Analyzer) Analyze(_ context.Context, criteria *streamv1.QueryRequest, metadata *commonv1.Metadata, s logical.Schema) (logical.Plan, error) {
+// Analyze converts logical expressions to executable operation tree represented by Plan.
+func Analyze(_ context.Context, criteria *streamv1.QueryRequest, metadata *commonv1.Metadata, s logical.Schema) (logical.Plan, error) {
 	// parse fields
-	plan, err := parseTags(criteria, metadata, s)
-	if err != nil {
-		return nil, err
-	}
-
-	// parse orderBy
-	queryOrder := criteria.GetOrderBy()
-	if queryOrder != nil {
-		if v, ok := plan.(*unresolvedTagFilter); ok {
-			v.unresolvedOrderBy = logical.NewOrderBy(queryOrder.GetIndexRuleName(), queryOrder.GetSort())
-		}
-	}
+	plan := parseTags(criteria, metadata)
 
 	// parse offset
-	plan = logical.NewOffset(plan, criteria.GetOffset())
+	plan = newOffset(plan, criteria.GetOffset())
 
 	// parse limit
 	limitParameter := criteria.GetLimit()
 	if limitParameter == 0 {
-		limitParameter = logical.DefaultLimit
+		limitParameter = defaultLimit
 	}
-	plan = logical.NewLimit(plan, limitParameter)
+	plan = newLimit(plan, limitParameter)
 
-	return plan.Analyze(s)
+	p, err := plan.Analyze(s)
+	if err != nil {
+		return nil, err
+	}
+	rules := []logical.OptimizeRule{
+		logical.NewPushDownOrder(criteria.OrderBy),
+		logical.NewPushDownMaxSize(int(limitParameter + criteria.GetOffset())),
+	}
+	if err := logical.ApplyRules(p, rules...); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+var (
+	_ logical.Plan           = (*limit)(nil)
+	_ logical.UnresolvedPlan = (*limit)(nil)
+)
+
+// Parent refers to a parent node in the execution tree(plan).
+type Parent struct {
+	UnresolvedInput logical.UnresolvedPlan
+	Input           logical.Plan
+}
+
+type limit struct {
+	*Parent
+	LimitNum uint32
+}
+
+func (l *limit) Execute(ec executor.StreamExecutionContext) ([]*streamv1.Element, error) {
+	entities, err := l.Parent.Input.(executor.StreamExecutable).Execute(ec)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(entities) > int(l.LimitNum) {
+		return entities[:l.LimitNum], nil
+	}
+
+	return entities, nil
+}
+
+func (l *limit) Analyze(s logical.Schema) (logical.Plan, error) {
+	var err error
+	l.Input, err = l.UnresolvedInput.Analyze(s)
+	if err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+func (l *limit) Schema() logical.Schema {
+	return l.Input.Schema()
+}
+
+func (l *limit) String() string {
+	return fmt.Sprintf("%s Limit: %d", l.Input.String(), l.LimitNum)
+}
+
+func (l *limit) Children() []logical.Plan {
+	return []logical.Plan{l.Input}
+}
+
+func newLimit(input logical.UnresolvedPlan, num uint32) logical.UnresolvedPlan {
+	return &limit{
+		Parent: &Parent{
+			UnresolvedInput: input,
+		},
+		LimitNum: num,
+	}
+}
+
+var (
+	_ logical.Plan           = (*offset)(nil)
+	_ logical.UnresolvedPlan = (*offset)(nil)
+)
+
+type offset struct {
+	*Parent
+	offsetNum uint32
+}
+
+func (l *offset) Execute(ec executor.StreamExecutionContext) ([]*streamv1.Element, error) {
+	elements, err := l.Parent.Input.(executor.StreamExecutable).Execute(ec)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(elements) > int(l.offsetNum) {
+		return elements[l.offsetNum:], nil
+	}
+
+	return []*streamv1.Element{}, nil
+}
+
+func (l *offset) Analyze(s logical.Schema) (logical.Plan, error) {
+	var err error
+	l.Input, err = l.UnresolvedInput.Analyze(s)
+	if err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+func (l *offset) Schema() logical.Schema {
+	return l.Input.Schema()
+}
+
+func (l *offset) String() string {
+	return fmt.Sprintf("%s Offset: %d", l.Input.String(), l.offsetNum)
+}
+
+func (l *offset) Children() []logical.Plan {
+	return []logical.Plan{l.Input}
+}
+
+func newOffset(input logical.UnresolvedPlan, num uint32) logical.UnresolvedPlan {
+	return &offset{
+		Parent: &Parent{
+			UnresolvedInput: input,
+		},
+		offsetNum: num,
+	}
 }
 
 // parseTags parses the query request to decide which kind of plan should be generated
@@ -106,18 +196,8 @@ func (a *Analyzer) Analyze(_ context.Context, criteria *streamv1.QueryRequest, m
 //
 //	i.e. they are top-level sharding keys. For example, for the current skywalking's streamSchema,
 //	we use service_id + service_instance_id + state as the compound sharding keys.
-func parseTags(criteria *streamv1.QueryRequest, metadata *commonv1.Metadata, s logical.Schema) (logical.UnresolvedPlan, error) {
+func parseTags(criteria *streamv1.QueryRequest, metadata *commonv1.Metadata) logical.UnresolvedPlan {
 	timeRange := criteria.GetTimeRange()
-
-	projTags := make([][]*logical.Tag, len(criteria.GetProjection().GetTagFamilies()))
-	for i, tagFamily := range criteria.GetProjection().GetTagFamilies() {
-		var projTagInFamily []*logical.Tag
-		for _, tagName := range tagFamily.GetTags() {
-			projTagInFamily = append(projTagInFamily, logical.NewTag(tagFamily.GetName(), tagName))
-		}
-		projTags[i] = projTagInFamily
-	}
-
-	return TagFilter(timeRange.GetBegin().AsTime(), timeRange.GetEnd().AsTime(), metadata,
-		criteria.Criteria, nil, projTags...), nil
+	return tagFilter(timeRange.GetBegin().AsTime(), timeRange.GetEnd().AsTime(), metadata,
+		criteria.Criteria, logical.ToTags(criteria.GetProjection()))
 }

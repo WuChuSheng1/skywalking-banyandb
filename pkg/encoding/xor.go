@@ -19,8 +19,6 @@ package encoding
 
 import (
 	"math/bits"
-
-	"github.com/apache/skywalking-banyandb/pkg/bit"
 )
 
 const (
@@ -31,7 +29,7 @@ const (
 // XOREncoder intends to compress uint64 data
 // https://www.vldb.org/pvldb/vol8/p1816-teller.pdf
 type XOREncoder struct {
-	bw       *bit.Writer
+	bw       *Writer
 	preVal   uint64
 	leading  int
 	trailing int
@@ -39,8 +37,8 @@ type XOREncoder struct {
 	first bool
 }
 
-// NewXOREncoder creates xor zstdEncoder for compressing uint64 data
-func NewXOREncoder(bw *bit.Writer) *XOREncoder {
+// NewXOREncoder creates xor zstdEncoder for compressing uint64 data.
+func NewXOREncoder(bw *Writer) *XOREncoder {
 	return &XOREncoder{
 		bw:    bw,
 		first: true,
@@ -82,21 +80,18 @@ func (e *XOREncoder) Write(val uint64) {
 	}
 }
 
-// XORDecoder decodes buffer to uint64 values using xor compress
+// XORDecoder decodes buffer to uint64 values using xor compress.
 type XORDecoder struct {
-	val uint64
-
-	br *bit.Reader
-
+	err      error
+	br       *Reader
+	val      uint64
 	leading  uint64
 	trailing uint64
-
-	first bool
-	err   error
+	first    bool
 }
 
-// NewXORDecoder create zstdDecoder decompress buffer using xor
-func NewXORDecoder(br *bit.Reader) *XORDecoder {
+// NewXORDecoder create zstdDecoder decompress buffer using xor.
+func NewXORDecoder(br *Reader) *XORDecoder {
 	s := &XORDecoder{
 		br:    br,
 		first: true,
@@ -104,7 +99,7 @@ func NewXORDecoder(br *bit.Reader) *XORDecoder {
 	return s
 }
 
-// Reset resets the underlying buffer to decode
+// Reset resets the underlying buffer to decode.
 func (d *XORDecoder) Reset() {
 	d.first = true
 	d.leading = 0
@@ -113,7 +108,7 @@ func (d *XORDecoder) Reset() {
 }
 
 // Next return if zstdDecoder has value in buffer using xor, do uncompress logic in next method,
-// data format reference zstdEncoder format
+// data format reference zstdEncoder format.
 func (d *XORDecoder) Next() bool {
 	if d.first {
 		// read first value
@@ -166,12 +161,12 @@ func (d *XORDecoder) Next() bool {
 	return true
 }
 
-// Value returns uint64 from buffer
+// Value returns uint64 from buffer.
 func (d *XORDecoder) Value() uint64 {
 	return d.val
 }
 
-// Err returns error raised in Next()
+// Err returns error raised in Next().
 func (d *XORDecoder) Err() error {
 	return d.err
 }

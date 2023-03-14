@@ -38,10 +38,12 @@ import (
 )
 
 var (
-	ErrEmptyRootPath   = errors.New("root path is empty")
+	errEmptyRootPath = errors.New("root path is empty")
+	// ErrMeasureNotExist denotes a measure doesn't exist in the metadata repo.
 	ErrMeasureNotExist = errors.New("measure doesn't exist")
 )
 
+// Service allows inspecting the measure data points.
 type Service interface {
 	run.PreRunner
 	run.Config
@@ -52,17 +54,15 @@ type Service interface {
 var _ Service = (*service)(nil)
 
 type service struct {
-	root   string
-	dbOpts tsdb.DatabaseOpts
-
 	schemaRepo    schemaRepo
 	writeListener bus.MessageListener
-	l             *logger.Logger
 	metadata      metadata.Repo
 	pipeline      queue.Queue
 	repo          discovery.ServiceRepo
-	// stop channel for the service
-	stopCh chan struct{}
+	l             *logger.Logger
+	stopCh        chan struct{}
+	root          string
+	dbOpts        tsdb.DatabaseOpts
 }
 
 func (s *service) Measure(metadata *commonv1.Metadata) (Measure, error) {
@@ -82,12 +82,13 @@ func (s *service) FlagSet() *run.FlagSet {
 	flagS.StringVar(&s.root, "measure-root-path", "/tmp", "the root path of database")
 	flagS.Int64Var(&s.dbOpts.BlockMemSize, "measure-block-mem-size", 16<<20, "block memory size")
 	flagS.Int64Var(&s.dbOpts.SeriesMemSize, "measure-seriesmeta-mem-size", 1<<20, "series metadata memory size")
+	flagS.Int64Var(&s.dbOpts.BlockInvertedIndex.BatchWaitSec, "measure-idx-batch-wait-sec", 1, "index batch wait in second")
 	return flagS
 }
 
 func (s *service) Validate() error {
 	if s.root == "" {
-		return ErrEmptyRootPath
+		return errEmptyRootPath
 	}
 	return nil
 }
@@ -144,6 +145,37 @@ func (s *service) Serve() run.StopNotify {
 		RegisterHandler(schema.KindGroup|schema.KindMeasure|schema.KindIndexRuleBinding|schema.KindIndexRule|schema.KindTopNAggregation,
 			&s.schemaRepo)
 
+	// start TopN manager after registering handlers
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	groups, err := s.metadata.GroupRegistry().ListGroup(ctx)
+	cancel()
+
+	if err != nil {
+		s.l.Err(err).Msg("fail to list groups")
+		return s.stopCh
+	}
+
+	for _, g := range groups {
+		if g.Catalog != commonv1.Catalog_CATALOG_MEASURE {
+			continue
+		}
+		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		allMeasureSchemas, listErr := s.metadata.MeasureRegistry().
+			ListMeasure(ctx, schema.ListOpt{Group: g.GetMetadata().GetName()})
+		cancel()
+		if listErr != nil {
+			s.l.Err(listErr).Str("group", g.GetMetadata().GetName()).Msg("fail to list measures in the group")
+			continue
+		}
+		for _, measureSchema := range allMeasureSchemas {
+			if res, ok := s.schemaRepo.LoadResource(measureSchema.GetMetadata()); ok {
+				if startErr := res.(*measure).startSteamingManager(s.pipeline, s.metadata); startErr != nil {
+					s.l.Err(startErr).Str("measure", measureSchema.GetMetadata().GetName()).Msg("fail to start streaming manager")
+				}
+			}
+		}
+	}
+
 	return s.stopCh
 }
 
@@ -154,7 +186,7 @@ func (s *service) GracefulStop() {
 	}
 }
 
-// NewService returns a new service
+// NewService returns a new service.
 func NewService(_ context.Context, metadata metadata.Repo, repo discovery.ServiceRepo, pipeline queue.Queue) (Service, error) {
 	return &service{
 		metadata: metadata,

@@ -185,10 +185,10 @@ func (sr *schemaRepo) loadMeasure(metadata *commonv1.Metadata) (*measure, bool) 
 var _ resourceSchema.ResourceSupplier = (*supplier)(nil)
 
 type supplier struct {
-	path     string
-	dbOpts   tsdb.DatabaseOpts
 	metadata metadata.Repo
 	l        *logger.Logger
+	path     string
+	dbOpts   tsdb.DatabaseOpts
 }
 
 func newSupplier(path string, metadata metadata.Repo, dbOpts tsdb.DatabaseOpts, l *logger.Logger) *supplier {
@@ -209,7 +209,7 @@ func (s *supplier) OpenResource(shardNum uint32, db tsdb.Supplier, spec resource
 	}, s.l)
 }
 
-func (s *supplier) ResourceSchema(repo metadata.Repo, md *commonv1.Metadata) (resourceSchema.ResourceSchema, error) {
+func (s *supplier) ResourceSchema(md *commonv1.Metadata) (resourceSchema.ResourceSchema, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return s.metadata.MeasureRegistry().GetMeasure(ctx, md)
@@ -221,9 +221,15 @@ func (s *supplier) OpenDB(groupSchema *commonv1.Group) (tsdb.Database, error) {
 	opts.Location = path.Join(s.path, groupSchema.Metadata.Name)
 	name := groupSchema.Metadata.Name
 	opts.EncodingMethod = tsdb.EncodingMethod{
-		EncoderPool: newEncoderPool(name, plainChunkSize, intChunkSize, s.l),
-		DecoderPool: newDecoderPool(name, plainChunkSize, intChunkSize, s.l),
+		EncoderPool:      newEncoderPool(name, intChunkNum, s.l),
+		DecoderPool:      newDecoderPool(name, intChunkNum, s.l),
+		ChunkSizeInBytes: intChunkSize,
 	}
+	opts.CompressionMethod = tsdb.CompressionMethod{
+		Type:             tsdb.CompressionTypeZSTD,
+		ChunkSizeInBytes: plainChunkSize,
+	}
+
 	var err error
 	if opts.BlockInterval, err = pb_v1.ToIntervalRule(groupSchema.ResourceOpts.BlockInterval); err != nil {
 		return nil, err

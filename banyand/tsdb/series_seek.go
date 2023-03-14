@@ -18,37 +18,31 @@
 package tsdb
 
 import (
-	"bytes"
-	"encoding/hex"
-	"time"
-
-	"github.com/dgraph-io/badger/v3/y"
-	"github.com/rs/zerolog"
-
 	"github.com/apache/skywalking-banyandb/api/common"
 	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
 	modelv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/model/v1"
 	"github.com/apache/skywalking-banyandb/banyand/kv"
-	"github.com/apache/skywalking-banyandb/pkg/encoding"
 	"github.com/apache/skywalking-banyandb/pkg/index"
 	"github.com/apache/skywalking-banyandb/pkg/logger"
 )
 
+// Iterator allows iterating a series in a time span.
 type Iterator interface {
 	Next() bool
 	Val() Item
 	Close() error
 }
 
+// Item allows retrieving raw data from an item.
 type Item interface {
 	Family(family []byte) ([]byte, error)
-	PrintContext(l *logger.Logger, family []byte, n int)
 	Val() ([]byte, error)
 	ID() common.ItemID
 	SortedField() []byte
 	Time() uint64
 }
 
+// SeekerBuilder a helper to build a Seeker.
 type SeekerBuilder interface {
 	Filter(predicator index.Filter) SeekerBuilder
 	OrderByIndex(indexRule *databasev1.IndexRule, order modelv1.Sort) SeekerBuilder
@@ -56,6 +50,7 @@ type SeekerBuilder interface {
 	Build() (Seeker, error)
 }
 
+// Seeker allows searching data in a Database.
 type Seeker interface {
 	Seek() ([]Iterator, error)
 }
@@ -63,13 +58,12 @@ type Seeker interface {
 var _ SeekerBuilder = (*seekerBuilder)(nil)
 
 type seekerBuilder struct {
-	seriesSpan *seriesSpan
-
 	predicator          index.Filter
-	order               modelv1.Sort
+	seriesSpan          *seriesSpan
 	indexRuleForSorting *databasev1.IndexRule
-	rangeOptsForSorting index.RangeOpts
 	l                   *logger.Logger
+	rangeOptsForSorting index.RangeOpts
+	order               modelv1.Sort
 }
 
 func (s *seekerBuilder) Build() (Seeker, error) {
@@ -109,11 +103,10 @@ func newSeeker(series []Iterator) Seeker {
 var _ Item = (*item)(nil)
 
 type item struct {
-	itemID      common.ItemID
 	data        kv.TimeSeriesReader
-	seriesID    common.SeriesID
 	sortedField []byte
-	decoderPool encoding.SeriesDecoderPool
+	itemID      common.ItemID
+	seriesID    common.SeriesID
 }
 
 func (i *item) Time() uint64 {
@@ -130,59 +123,6 @@ func (i *item) Family(family []byte) ([]byte, error) {
 		family:   family,
 	}
 	return i.data.Get(d.marshal(), uint64(i.itemID))
-}
-
-func (i *item) PrintContext(l *logger.Logger, family []byte, n int) {
-	decoder := i.decoderPool.Get(family)
-	defer i.decoderPool.Put(decoder)
-	d := dataBucket{
-		seriesID: i.seriesID,
-		family:   family,
-	}
-	key := d.marshal()
-	pre, next := i.data.Context(key, uint64(i.itemID), n)
-	defer pre.Close()
-	defer next.Close()
-	j := 0
-	each := func(iter kv.Iterator, logEvent *zerolog.Event) *zerolog.Event {
-		if !bytes.Equal(key, iter.Key()) {
-			return logEvent
-		}
-		j++
-
-		logEvent = logEvent.Int("i", j).
-			Time("ts", time.Unix(0, int64(y.ParseTs(iter.RawKey()))))
-		locArr := zerolog.Arr()
-		rangeArr := zerolog.Arr()
-		decodedNumArr := zerolog.Arr()
-		if err := decoder.Decode(family, iter.Val()); err != nil {
-			locArr.Str("mem")
-		} else {
-			locArr.Str("table")
-			start, end := decoder.Range()
-			rangeArr.Time(time.Unix(0, int64(start)))
-			rangeArr.Time(time.Unix(0, int64(end)))
-			decodedNumArr.Int(decoder.Len())
-		}
-		logEvent = logEvent.Array("loc", locArr).Array("range", rangeArr).Array("decodedNum", decodedNumArr)
-		return logEvent
-	}
-
-	s := hex.EncodeToString(key)
-	if len(s) > 7 {
-		s = s[:7]
-	}
-	event := l.Info().Str("prefix", s).Time("ts", time.Unix(0, int64(i.itemID)))
-	for ; pre.Valid() && j < n; pre.Next() {
-		event = each(pre, event)
-	}
-	event.Msg("print previous lines")
-	j = 0
-	event = l.Info().Str("prefix", s).Time("ts", time.Unix(0, int64(i.itemID)))
-	for ; next.Valid() && j < n; next.Next() {
-		event = each(next, event)
-	}
-	event.Msg("print next lines")
 }
 
 func (i *item) Val() ([]byte, error) {

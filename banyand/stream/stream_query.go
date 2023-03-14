@@ -31,18 +31,22 @@ import (
 	"github.com/apache/skywalking-banyandb/pkg/partition"
 )
 
-var ErrTagFamilyNotExist = errors.New("tag family doesn't exist")
+var errTagFamilyNotExist = errors.New("tag family doesn't exist")
 
+// Query allow to retrieve elements in a series of streams.
 type Query interface {
 	Stream(stream *commonv1.Metadata) (Stream, error)
 }
 
+// Stream allows inspecting elements' details.
 type Stream interface {
 	io.Closer
 	Shards(entity tsdb.Entity) ([]tsdb.Shard, error)
 	Shard(id common.ShardID) (tsdb.Shard, error)
 	ParseTagFamily(family string, item tsdb.Item) (*modelv1.TagFamily, error)
 	ParseElementID(item tsdb.Item) (string, error)
+	GetSchema() *databasev1.Stream
+	GetIndexRules() []*databasev1.IndexRule
 }
 
 var _ Stream = (*stream)(nil)
@@ -101,7 +105,7 @@ func (s *stream) ParseTagFamily(family string, item tsdb.Item) (*modelv1.TagFami
 		}
 	}
 	if tagSpec == nil {
-		return nil, ErrTagFamilyNotExist
+		return nil, errTagFamilyNotExist
 	}
 	for i, tag := range tagFamily.GetTags() {
 		tags[i] = &modelv1.Tag{

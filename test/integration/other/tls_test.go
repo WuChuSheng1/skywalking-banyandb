@@ -24,6 +24,7 @@ import (
 
 	g "github.com/onsi/ginkgo/v2"
 	gm "github.com/onsi/gomega"
+	"github.com/onsi/gomega/gleak"
 	grpclib "google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
@@ -40,6 +41,7 @@ var _ = g.Describe("Query service_cpm_minute", func() {
 	var baseTime time.Time
 	var interval time.Duration
 	var conn *grpclib.ClientConn
+	var goods []gleak.Goroutine
 
 	g.BeforeEach(func() {
 		_, currentFile, _, _ := runtime.Caller(0)
@@ -47,7 +49,7 @@ var _ = g.Describe("Query service_cpm_minute", func() {
 		certFile := filepath.Join(basePath, "testdata/server_cert.pem")
 		keyFile := filepath.Join(basePath, "testdata/server_key.pem")
 		var addr string
-		addr, _, deferFn = setup.SetUp("--tls=true", "--cert-file="+certFile, "--key-file="+keyFile)
+		addr, _, deferFn = setup.Common("--tls=true", "--cert-file="+certFile, "--key-file="+keyFile)
 		var err error
 		creds, err := credentials.NewClientTLSFromFile(certFile, "localhost")
 		gm.Expect(err).NotTo(gm.HaveOccurred())
@@ -57,10 +59,12 @@ var _ = g.Describe("Query service_cpm_minute", func() {
 		baseTime = timestamp.NowMilli()
 		interval = 500 * time.Millisecond
 		casesMeasureData.Write(conn, "service_cpm_minute", "sw_metric", "service_cpm_minute_data.json", baseTime, interval)
+		goods = gleak.Goroutines()
 	})
 	g.AfterEach(func() {
 		gm.Expect(conn.Close()).To(gm.Succeed())
 		deferFn()
+		gm.Eventually(gleak.Goroutines, flags.EventuallyTimeout).ShouldNot(gleak.HaveLeaked(goods))
 	})
 	g.It("queries a tls server", func() {
 		gm.Eventually(func(innerGm gm.Gomega) {

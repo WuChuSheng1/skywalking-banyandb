@@ -18,6 +18,7 @@
 package stream
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -33,15 +34,17 @@ import (
 	"github.com/apache/skywalking-banyandb/pkg/timestamp"
 )
 
-var _ logical.UnresolvedPlan = (*unresolvedTagFilter)(nil)
+var (
+	_                        logical.UnresolvedPlan = (*unresolvedTagFilter)(nil)
+	errMultipleGlobalIndexes                        = errors.New("multiple global indexes are not supported")
+)
 
 type unresolvedTagFilter struct {
-	unresolvedOrderBy *logical.UnresolvedOrderBy
-	startTime         time.Time
-	endTime           time.Time
-	metadata          *commonv1.Metadata
-	projectionTags    [][]*logical.Tag
-	criteria          *modelv1.Criteria
+	startTime      time.Time
+	endTime        time.Time
+	metadata       *commonv1.Metadata
+	criteria       *modelv1.Criteria
+	projectionTags [][]*logical.Tag
 }
 
 func (uis *unresolvedTagFilter) Analyze(s logical.Schema) (logical.Plan, error) {
@@ -57,7 +60,8 @@ func (uis *unresolvedTagFilter) Analyze(s logical.Schema) (logical.Plan, error) 
 	var err error
 	ctx.filter, ctx.entities, err = logical.BuildLocalFilter(uis.criteria, s, entityDict, entity)
 	if err != nil {
-		if ge, ok := err.(*logical.GlobalIndexError); ok {
+		var ge logical.GlobalIndexError
+		if errors.As(err, &ge) {
 			ctx.globalConditions = append(ctx.globalConditions, ge.IndexRule, ge.Expr)
 		} else {
 			return nil, err
@@ -80,8 +84,9 @@ func (uis *unresolvedTagFilter) Analyze(s logical.Schema) (logical.Plan, error) 
 		if errFilter != nil {
 			return nil, errFilter
 		}
-		if tagFilter != logical.BypassFilter {
-			plan = NewTagFilter(s, plan, tagFilter)
+		if tagFilter != logical.DummyFilter {
+			// create tagFilter with a projected view
+			plan = newTagFilter(s.ProjTags(ctx.projTagsRefs...), plan, tagFilter)
 		}
 	}
 	return plan, err
@@ -90,7 +95,7 @@ func (uis *unresolvedTagFilter) Analyze(s logical.Schema) (logical.Plan, error) 
 func (uis *unresolvedTagFilter) selectIndexScanner(ctx *analyzeContext) (logical.Plan, error) {
 	if len(ctx.globalConditions) > 0 {
 		if len(ctx.globalConditions) > 2 {
-			return nil, logical.ErrMultipleGlobalIndexes
+			return nil, errMultipleGlobalIndexes
 		}
 		return &globalIndexScan{
 			schema:            ctx.s,
@@ -100,15 +105,7 @@ func (uis *unresolvedTagFilter) selectIndexScanner(ctx *analyzeContext) (logical
 			expr:              ctx.globalConditions[1].(logical.LiteralExpr),
 		}, nil
 	}
-
-	// resolve sub-plan with the projected view of streamSchema
-	orderBySubPlan, err := uis.unresolvedOrderBy.Analyze(ctx.s.ProjTags(ctx.projTagsRefs...))
-	if err != nil {
-		return nil, err
-	}
-
 	return &localIndexScan{
-		OrderBy:           orderBySubPlan,
 		timeRange:         timestamp.NewInclusiveTimeRange(uis.startTime, uis.endTime),
 		schema:            ctx.s,
 		projectionTagRefs: ctx.projTagsRefs,
@@ -119,16 +116,14 @@ func (uis *unresolvedTagFilter) selectIndexScanner(ctx *analyzeContext) (logical
 	}, nil
 }
 
-func TagFilter(startTime, endTime time.Time, metadata *commonv1.Metadata, criteria *modelv1.Criteria,
-	orderBy *logical.UnresolvedOrderBy, projection ...[]*logical.Tag,
+func tagFilter(startTime, endTime time.Time, metadata *commonv1.Metadata, criteria *modelv1.Criteria, projection [][]*logical.Tag,
 ) logical.UnresolvedPlan {
 	return &unresolvedTagFilter{
-		unresolvedOrderBy: orderBy,
-		startTime:         startTime,
-		endTime:           endTime,
-		metadata:          metadata,
-		criteria:          criteria,
-		projectionTags:    projection,
+		startTime:      startTime,
+		endTime:        endTime,
+		metadata:       metadata,
+		criteria:       criteria,
+		projectionTags: projection,
 	}
 }
 
@@ -158,7 +153,7 @@ type tagFilterPlan struct {
 	tagFilter logical.TagFilter
 }
 
-func NewTagFilter(s logical.Schema, parent logical.Plan, tagFilter logical.TagFilter) logical.Plan {
+func newTagFilter(s logical.Schema, parent logical.Plan, tagFilter logical.TagFilter) logical.Plan {
 	return &tagFilterPlan{
 		s:         s,
 		parent:    parent,
@@ -173,7 +168,7 @@ func (t *tagFilterPlan) Execute(ec executor.StreamExecutionContext) ([]*streamv1
 	}
 	filteredElements := make([]*streamv1.Element, 0)
 	for _, e := range entities {
-		ok, err := t.tagFilter.Match(e.TagFamilies)
+		ok, err := t.tagFilter.Match(logical.TagFamilies(e.TagFamilies), t.s)
 		if err != nil {
 			return nil, err
 		}

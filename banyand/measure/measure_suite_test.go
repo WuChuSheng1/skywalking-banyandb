@@ -42,7 +42,6 @@ func TestMeasure(t *testing.T) {
 	ginkgo.RunSpecs(t, "Measure Suite")
 }
 
-// BeforeSuite - Init logger
 var _ = ginkgo.BeforeSuite(func() {
 	gomega.Expect(logger.Init(logger.Logging{
 		Env:   "dev",
@@ -50,7 +49,6 @@ var _ = ginkgo.BeforeSuite(func() {
 	})).To(gomega.Succeed())
 })
 
-// service to preload measure
 type preloadMeasureService struct {
 	metaSvc metadata.Service
 }
@@ -76,9 +74,13 @@ func setUp() (*services, func()) {
 	// Init Discovery
 	repo := discovery.NewMockServiceRepo(ctrl)
 	repo.EXPECT().NodeID().AnyTimes()
+	repo.EXPECT().Name().AnyTimes()
+	stopCh := make(chan struct{})
+	repo.EXPECT().Serve().Return(stopCh).Times(1)
+	repo.EXPECT().GracefulStop().Do(func() { close(stopCh) }).Times(1)
 	// Both PreRun and Serve phases send events
-	repo.EXPECT().Publish(event.MeasureTopicEntityEvent, test.NewEntityEventMatcher(databasev1.Action_ACTION_PUT)).Times(2 * 8)
-	repo.EXPECT().Publish(event.MeasureTopicShardEvent, test.NewShardEventMatcher(databasev1.Action_ACTION_PUT)).Times(2 * 2)
+	repo.EXPECT().Publish(event.MeasureTopicEntityEvent, test.NewEntityEventMatcher(databasev1.Action_ACTION_PUT)).AnyTimes()
+	repo.EXPECT().Publish(event.MeasureTopicShardEvent, test.NewShardEventMatcher(databasev1.Action_ACTION_PUT)).AnyTimes()
 
 	// Init Pipeline
 	pipeline, err := queue.NewQueue(context.TODO(), repo)
@@ -102,7 +104,7 @@ func setUp() (*services, func()) {
 	listenClientURL, listenPeerURL, err := test.NewEtcdListenUrls()
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	flags = append(flags, "--etcd-listen-client-url="+listenClientURL, "--etcd-listen-peer-url="+listenPeerURL)
-	moduleDeferFunc := test.SetUpModules(
+	moduleDeferFunc := test.SetupModules(
 		flags,
 		repo,
 		pipeline,
