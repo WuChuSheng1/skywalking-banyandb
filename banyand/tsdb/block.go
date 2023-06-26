@@ -25,10 +25,13 @@ import (
 	"path"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
+	"github.com/dgraph-io/badger/v3"
 	"github.com/pkg/errors"
 	"go.uber.org/multierr"
 
@@ -40,33 +43,59 @@ import (
 	"github.com/apache/skywalking-banyandb/pkg/index/inverted"
 	"github.com/apache/skywalking-banyandb/pkg/index/lsm"
 	"github.com/apache/skywalking-banyandb/pkg/logger"
+	"github.com/apache/skywalking-banyandb/pkg/meter"
 	"github.com/apache/skywalking-banyandb/pkg/timestamp"
 )
 
 const (
-	componentMain              = "main"
 	componentSecondInvertedIdx = "inverted"
 	componentSecondLSMIdx      = "lsm"
 
-	defaultMainMemorySize = 8 << 20
 	defaultEnqueueTimeout = 500 * time.Millisecond
+	itemIDLength          = unsafe.Sizeof(common.ItemID(0))
 )
 
-var errBlockClosingInterrupted = errors.New("interrupt to close the block")
+var (
+	blockMeterProvider          = observability.NewMeterProvider(meterTSDB.SubScope("block"))
+	blockOpenedTimeSecondsGauge = blockMeterProvider.Gauge("opened_time_seconds", common.LabelNames()...)
+	blockReferencesGauge        = blockMeterProvider.Gauge("refs", common.LabelNames()...)
+
+	blockCompressedSize     = blockMeterProvider.Gauge("compressed_size", append(common.LabelNames(), "from", "to")...)
+	blockUncompressedSize   = blockMeterProvider.Gauge("uncompressed_size", append(common.LabelNames(), "from", "to")...)
+	blockCompressedBlockNum = blockMeterProvider.Gauge("compressed_block_num", append(common.LabelNames(), "from", "to")...)
+	blockCompressedEntryNum = blockMeterProvider.Gauge("compressed_entry_num", append(common.LabelNames(), "from", "to")...)
+	blockEncodedSize        = blockMeterProvider.Gauge("encoded_size", append(common.LabelNames(), "from", "to")...)
+	blockUnencodedSize      = blockMeterProvider.Gauge("unencoded_size", append(common.LabelNames(), "from", "to")...)
+	blockEncodedBlockNum    = blockMeterProvider.Gauge("encoded_block_num", append(common.LabelNames(), "from", "to")...)
+	blockEncodedEntryNum    = blockMeterProvider.Gauge("encoded_entry_num", append(common.LabelNames(), "from", "to")...)
+	blockCompactionMap      = map[badger.TableBuilderSizeKeyType]meter.Gauge{
+		badger.TableBuilderSizeKeyCompressedSize:     blockCompressedSize,
+		badger.TableBuilderSizeKeyUncompressedSize:   blockUncompressedSize,
+		badger.TableBuilderSizeKeyCompressedBlockNum: blockCompressedBlockNum,
+		badger.TableBuilderSizeKeyCompressedEntryNum: blockCompressedEntryNum,
+		badger.TableBuilderSizeKeyEncodedSize:        blockEncodedSize,
+		badger.TableBuilderSizeKeyUnEncodedSize:      blockUnencodedSize,
+		badger.TableBuilderSizeKeyEncodedBlockNum:    blockEncodedBlockNum,
+		badger.TableBuilderSizeKeyEncodedEntryNum:    blockEncodedEntryNum,
+	}
+
+	errBlockClosingInterrupted = errors.New("interrupt to close the block")
+)
 
 type block struct {
-	store    kv.TimeSeriesStore
-	openOpts openOpts
-	queue    bucket.Queue
-	bucket.Reporter
-	clock         timestamp.Clock
-	lsmIndex      index.Store
+	openOpts      openOpts
 	invertedIndex index.Store
-	closed        *atomic.Bool
-	l             *logger.Logger
-	deleted       *atomic.Bool
-	ref           *atomic.Int32
-	position      common.Position
+	tsTable       TSTable
+	queue         bucket.Queue
+	bucket.Reporter
+	clock            timestamp.Clock
+	lsmIndex         index.Store
+	closeBufferTimer *time.Timer
+	closed           *atomic.Bool
+	ref              *atomic.Int32
+	l                *logger.Logger
+	deleted          *atomic.Bool
+	position         common.Position
 	timestamp.TimeRange
 	segSuffix   string
 	suffix      string
@@ -78,10 +107,9 @@ type block struct {
 }
 
 type openOpts struct {
-	store     []kv.TimeSeriesOptions
-	storePath string
-	inverted  inverted.StoreOpts
-	lsm       lsm.StoreOpts
+	tsTableFactory TSTableFactory
+	inverted       inverted.StoreOpts
+	lsm            lsm.StoreOpts
 }
 
 type blockOpts struct {
@@ -114,54 +142,42 @@ func newBlock(ctx context.Context, opts blockOpts) (b *block, err error) {
 		closed:    &atomic.Bool{},
 		deleted:   &atomic.Bool{},
 		queue:     opts.queue,
+		position:  common.GetPosition(ctx),
 	}
-	b.l = logger.Fetch(ctx, b.String())
+	l := logger.Fetch(ctx, b.String())
+	b.openOpts, err = options(ctx, opts.path, l)
+	if err != nil {
+		return nil, err
+	}
+	b.l = l
 	b.Reporter = bucket.NewTimeBasedReporter(b.String(), opts.timeRange, clock, opts.scheduler)
 	b.closed.Store(true)
-	b.options(ctx)
-	position := ctx.Value(common.PositionKey)
-	if position != nil {
-		b.position = position.(common.Position)
-	}
-
 	return b, nil
 }
 
-func (b *block) options(ctx context.Context) {
+func options(ctx context.Context, root string, l *logger.Logger) (openOpts, error) {
 	var options DatabaseOpts
-	o := ctx.Value(optionsKey)
-	if o != nil {
-		options = o.(DatabaseOpts)
+	o := ctx.Value(OptionsKey)
+	if o == nil {
+		return openOpts{}, errors.New("database options not found")
 	}
-	if options.EncodingMethod.EncoderPool != nil && options.EncodingMethod.DecoderPool != nil {
-		b.openOpts.store = append(b.openOpts.store, kv.TSSWithEncoding(options.EncodingMethod.EncoderPool,
-			options.EncodingMethod.DecoderPool, options.EncodingMethod.ChunkSizeInBytes))
-	}
-	if options.CompressionMethod.Type == CompressionTypeZSTD {
-		b.openOpts.store = append(b.openOpts.store, kv.TSSWithZSTDCompression(options.CompressionMethod.ChunkSizeInBytes))
-	}
-	var memSize int64
-	if options.BlockMemSize < 1 {
-		memSize = defaultMainMemorySize
-	} else {
-		memSize = options.BlockMemSize
-	}
-	b.openOpts.store = append(b.openOpts.store, kv.TSSWithMemTableSize(memSize), kv.TSSWithLogger(b.l.Named(componentMain)))
-	b.openOpts.storePath = path.Join(b.path, componentMain)
-	b.openOpts.inverted = inverted.StoreOpts{
-		Path:         path.Join(b.path, componentSecondInvertedIdx),
-		Logger:       b.l.Named(componentSecondInvertedIdx),
+	options = o.(DatabaseOpts)
+	var opts openOpts
+	opts.inverted = inverted.StoreOpts{
+		Path:         path.Join(root, componentSecondInvertedIdx),
+		Logger:       l.Named(componentSecondInvertedIdx),
 		BatchWaitSec: options.BlockInvertedIndex.BatchWaitSec,
 	}
-	lsmMemSize := memSize / 8
-	if lsmMemSize < defaultKVMemorySize {
-		lsmMemSize = defaultKVMemorySize
+	opts.lsm = lsm.StoreOpts{
+		Path:         path.Join(root, componentSecondLSMIdx),
+		Logger:       l.Named(componentSecondLSMIdx),
+		MemTableSize: defaultKVMemorySize,
 	}
-	b.openOpts.lsm = lsm.StoreOpts{
-		Path:         path.Join(b.path, componentSecondLSMIdx),
-		Logger:       b.l.Named(componentSecondLSMIdx),
-		MemTableSize: lsmMemSize,
+	opts.tsTableFactory = options.TSTableFactory
+	if opts.tsTableFactory == nil {
+		return opts, errors.New("ts table factory is nil")
 	}
+	return opts, nil
 }
 
 func (b *block) openSafely() (err error) {
@@ -177,10 +193,11 @@ func (b *block) openSafely() (err error) {
 }
 
 func (b *block) open() (err error) {
-	if b.store, err = kv.OpenTimeSeriesStore(b.openOpts.storePath, b.openOpts.store...); err != nil {
+	if b.tsTable, err = b.openOpts.tsTableFactory.NewTSTable(BlockExpiryTracker{ttl: b.End, clock: b.clock},
+		b.path, b.position, b.l); err != nil {
 		return err
 	}
-	b.closableLst = append(b.closableLst, b.store)
+	b.closableLst = append(b.closableLst, b.tsTable)
 	if b.invertedIndex, err = inverted.NewStore(b.openOpts.inverted); err != nil {
 		return err
 	}
@@ -190,6 +207,21 @@ func (b *block) open() (err error) {
 	b.closableLst = append(b.closableLst, b.invertedIndex, b.lsmIndex)
 	b.ref.Store(0)
 	b.closed.Store(false)
+	blockOpenedTimeSecondsGauge.Set(float64(time.Now().Unix()), b.position.LabelValues()...)
+	plv := b.position.LabelValues()
+	observability.MetricsCollector.Register(strings.Join(plv, "-"), func() {
+		stats := b.tsTable.CollectStats()
+		stats.TableBuilderSize.Range(func(label interface{}, value interface{}) bool {
+			key := label.(badger.TableBuilderSizeKey)
+			counter := value.(*atomic.Int64)
+			from, to := getLevelLabels(key.FromLevel, key.ToLevel)
+			labelValues := append(b.position.LabelValues(), from, to)
+			if block, ok := blockCompactionMap[key.Type]; ok {
+				block.Set(float64(counter.Load()), labelValues...)
+			}
+			return true
+		})
+	})
 	return nil
 }
 
@@ -225,29 +257,17 @@ func (b *block) delegate(ctx context.Context) (blockDelegate, error) {
 }
 
 func (b *block) incRef() bool {
-loop:
 	if b.Closed() {
 		return false
 	}
-	r := b.ref.Load()
-	if b.ref.CompareAndSwap(r, r+1) {
-		return true
-	}
-	runtime.Gosched()
-	goto loop
+	b.ref.Add(1)
+	blockReferencesGauge.Set(float64(b.ref.Load()), b.position.LabelValues()...)
+	return true
 }
 
 func (b *block) Done() {
-loop:
-	r := b.ref.Load()
-	if r < 1 {
-		return
-	}
-	if b.ref.CompareAndSwap(r, r-1) {
-		return
-	}
-	runtime.Gosched()
-	goto loop
+	b.ref.Add(-1)
+	blockReferencesGauge.Set(float64(b.ref.Load()), b.position.LabelValues()...)
 }
 
 func (b *block) waitDone(stopped *atomic.Bool) <-chan struct{} {
@@ -284,8 +304,26 @@ func (b *block) close(ctx context.Context) (err error) {
 	case <-ch:
 	}
 	b.closed.Store(true)
+	if b.closeBufferTimer != nil {
+		b.closeBufferTimer.Stop()
+	}
+	plv := b.position.LabelValues()
+	observability.MetricsCollector.Unregister(strings.Join(plv, "-"))
+	stats := b.tsTable.CollectStats()
+	stats.TableBuilderSize.Range(func(label interface{}, value interface{}) bool {
+		key := label.(badger.TableBuilderSizeKey)
+		from, to := getLevelLabels(key.FromLevel, key.ToLevel)
+		labelValues := append(b.position.LabelValues(), from, to)
+		if block, ok := blockCompactionMap[key.Type]; ok {
+			block.Delete(labelValues...)
+		}
+		return true
+	})
 	for _, closer := range b.closableLst {
 		err = multierr.Append(err, closer.Close())
+	}
+	for _, g := range []meter.Gauge{blockOpenedTimeSecondsGauge, blockReferencesGauge} {
+		g.Delete(b.position.LabelValues()...)
 	}
 	return err
 }
@@ -307,14 +345,8 @@ func (b *block) String() string {
 	return fmt.Sprintf("BlockID-%s-%s", b.segSuffix, b.suffix)
 }
 
-func (b *block) stats() (names []string, stats []observability.Statistics) {
-	names = append(names, componentMain, componentSecondInvertedIdx, componentSecondLSMIdx)
-	if b.Closed() {
-		stats = make([]observability.Statistics, 3)
-		return
-	}
-	stats = append(stats, b.store.Stats(), b.invertedIndex.Stats(), b.lsmIndex.Stats())
-	return names, stats
+func (b *block) Get(key []byte, ts uint64) ([]byte, error) {
+	return b.tsTable.Get(key, time.Unix(0, int64(ts)))
 }
 
 type blockDelegate interface {
@@ -340,7 +372,7 @@ type bDelegate struct {
 }
 
 func (d *bDelegate) dataReader() kv.TimeSeriesReader {
-	return d.delegate.store
+	return d.delegate
 }
 
 func (d *bDelegate) lsmIndexReader() index.Searcher {
@@ -364,19 +396,53 @@ func (d *bDelegate) identity() (segID SectionID, blockID SectionID) {
 }
 
 func (d *bDelegate) write(key []byte, val []byte, ts time.Time) error {
-	return d.delegate.store.Put(key, val, uint64(ts.UnixNano()))
+	if err := d.delegate.tsTable.Put(key, val, ts); err != nil {
+		receivedNumCounter.Inc(1, append(d.delegate.position.ShardLabelValues(), "tst", "true")...)
+		return err
+	}
+	receivedBytesCounter.Inc(float64(len(key)+len(val)), append(d.delegate.position.ShardLabelValues(), "tst")...)
+	receivedNumCounter.Inc(1, append(d.delegate.position.ShardLabelValues(), "tst", "false")...)
+	return nil
 }
 
 func (d *bDelegate) writePrimaryIndex(field index.Field, id common.ItemID) error {
-	return d.delegate.lsmIndex.Write([]index.Field{field}, id)
+	if err := d.delegate.lsmIndex.Write([]index.Field{field}, uint64(id)); err != nil {
+		receivedNumCounter.Inc(1, append(d.delegate.position.ShardLabelValues(), "primary", "true")...)
+		return err
+	}
+	receivedBytesCounter.Inc(float64(len(field.Marshal())+int(itemIDLength)), append(d.delegate.position.ShardLabelValues(), "primary")...)
+	receivedNumCounter.Inc(1, append(d.delegate.position.ShardLabelValues(), "primary", "false")...)
+	return nil
 }
 
 func (d *bDelegate) writeLSMIndex(fields []index.Field, id common.ItemID) error {
-	return d.delegate.lsmIndex.Write(fields, id)
+	total := 0
+	for _, f := range fields {
+		total += len(f.Marshal())
+	}
+
+	if err := d.delegate.lsmIndex.Write(fields, uint64(id)); err != nil {
+		receivedNumCounter.Inc(1, append(d.delegate.position.ShardLabelValues(), "local_lsm", "true")...)
+		return err
+	}
+	receivedBytesCounter.Inc(float64(total+int(itemIDLength)), append(d.delegate.position.ShardLabelValues(), "local_lsm")...)
+	receivedNumCounter.Inc(1, append(d.delegate.position.ShardLabelValues(), "local_lsm", "false")...)
+	return nil
 }
 
 func (d *bDelegate) writeInvertedIndex(fields []index.Field, id common.ItemID) error {
-	return d.delegate.invertedIndex.Write(fields, id)
+	total := 0
+	for _, f := range fields {
+		total += len(f.Marshal())
+	}
+
+	if err := d.delegate.invertedIndex.Write(fields, uint64(id)); err != nil {
+		receivedNumCounter.Inc(1, append(d.delegate.position.ShardLabelValues(), "local_inverted", "true")...)
+		return err
+	}
+	receivedBytesCounter.Inc(float64(total+int(itemIDLength)), append(d.delegate.position.ShardLabelValues(), "local_inverted")...)
+	receivedNumCounter.Inc(1, append(d.delegate.position.ShardLabelValues(), "local_inverted", "false")...)
+	return nil
 }
 
 func (d *bDelegate) contains(ts time.Time) bool {
@@ -390,4 +456,15 @@ func (d *bDelegate) String() string {
 func (d *bDelegate) Close() error {
 	d.delegate.Done()
 	return nil
+}
+
+func getLevelLabels(fromLevel, toLevel int) (string, string) {
+	from := fmt.Sprintf("l%d", fromLevel)
+	to := fmt.Sprintf("l%d", toLevel)
+
+	if fromLevel < 0 {
+		from = "mem"
+	}
+
+	return from, to
 }

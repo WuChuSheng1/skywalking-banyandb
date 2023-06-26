@@ -27,6 +27,8 @@ import (
 var (
 	// ErrGRPCResourceNotFound indicates the resource doesn't exist.
 	ErrGRPCResourceNotFound = statusGRPCResourceNotFound.Err()
+	// ErrClosed indicates the registry is closed.
+	ErrClosed = errors.New("metadata registry is closed")
 
 	statusGRPCInvalidArgument  = status.New(codes.InvalidArgument, "banyandb: input is invalid")
 	statusGRPCResourceNotFound = status.New(codes.NotFound, "banyandb: resource not found")
@@ -34,8 +36,6 @@ var (
 	errGRPCAlreadyExists       = statusGRPCAlreadyExists.Err()
 	statusDataLoss             = status.New(codes.DataLoss, "banyandb: resource corrupts.")
 	errGRPCDataLoss            = statusDataLoss.Err()
-
-	errClosed = errors.New("metadata registry is closed")
 )
 
 // BadRequest creates a gRPC error with error details with type BadRequest,
@@ -49,8 +49,4 @@ func BadRequest(field, desc string) error {
 	br.FieldViolations = append(br.FieldViolations, v)
 	st, _ := statusGRPCInvalidArgument.WithDetails(br)
 	return st.Err()
-}
-
-func isNotFound(err error) bool {
-	return errors.Is(err, ErrGRPCResourceNotFound)
 }

@@ -30,6 +30,7 @@ import (
 	"github.com/apache/skywalking-banyandb/api/data"
 	measurev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/measure/v1"
 	"github.com/apache/skywalking-banyandb/banyand/tsdb"
+	"github.com/apache/skywalking-banyandb/pkg/accesslog"
 	"github.com/apache/skywalking-banyandb/pkg/bus"
 	"github.com/apache/skywalking-banyandb/pkg/logger"
 	"github.com/apache/skywalking-banyandb/pkg/timestamp"
@@ -38,11 +39,20 @@ import (
 type measureService struct {
 	measurev1.UnimplementedMeasureServiceServer
 	*discoveryService
-	sampled *logger.Logger
+	sampled            *logger.Logger
+	ingestionAccessLog accesslog.Log
 }
 
 func (ms *measureService) setLogger(log *logger.Logger) {
 	ms.sampled = log.Sampled(10)
+}
+
+func (ms *measureService) activeIngestionAccessLog(root string) (err error) {
+	if ms.ingestionAccessLog, err = accesslog.
+		NewFileLog(root, "measure-ingest-%s", 10*time.Minute, ms.log); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (ms *measureService) Write(measure measurev1.MeasureService_WriteServer) error {
@@ -78,13 +88,16 @@ func (ms *measureService) Write(measure measurev1.MeasureService_WriteServer) er
 			reply(measure, ms.sampled)
 			continue
 		}
-		iwr := &measurev1.InternalWriteRequest{
-			Request:    writeRequest,
-			ShardId:    uint32(shardID),
-			SeriesHash: tsdb.HashEntity(entity),
+		if ms.ingestionAccessLog != nil {
+			if errAccessLog := ms.ingestionAccessLog.Write(writeRequest); errAccessLog != nil {
+				ms.sampled.Error().Err(errAccessLog).RawJSON("written", logger.Proto(writeRequest)).Msg("failed to write access log")
+			}
 		}
-		if ms.log.Debug().Enabled() {
-			iwr.EntityValues = tagValues.Encode()
+		iwr := &measurev1.InternalWriteRequest{
+			Request:      writeRequest,
+			ShardId:      uint32(shardID),
+			SeriesHash:   tsdb.HashEntity(entity),
+			EntityValues: tagValues.Encode(),
 		}
 		message := bus.NewMessage(bus.MessageID(time.Now().UnixNano()), iwr)
 		_, errWritePub := ms.pipeline.Publish(data.TopicMeasureWrite, message)
@@ -145,4 +158,8 @@ func (ms *measureService) TopN(_ context.Context, topNRequest *measurev1.TopNReq
 		return nil, errors.WithMessage(errQueryMsg, d.Msg())
 	}
 	return nil, nil
+}
+
+func (ms *measureService) Close() error {
+	return ms.ingestionAccessLog.Close()
 }

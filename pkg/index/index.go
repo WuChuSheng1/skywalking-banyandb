@@ -28,7 +28,6 @@ import (
 	"github.com/apache/skywalking-banyandb/api/common"
 	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
 	modelv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/model/v1"
-	"github.com/apache/skywalking-banyandb/banyand/observability"
 	"github.com/apache/skywalking-banyandb/pkg/convert"
 	"github.com/apache/skywalking-banyandb/pkg/index/posting"
 )
@@ -49,12 +48,20 @@ func (f FieldKey) MarshalIndexRule() string {
 
 // Marshal encodes f to bytes.
 func (f FieldKey) Marshal() []byte {
-	s := f.SeriesID.Marshal()
+	var s []byte
+	if f.HasSeriesID() {
+		s = f.SeriesID.Marshal()
+	}
 	i := []byte(f.MarshalIndexRule())
 	b := make([]byte, len(s)+len(i))
-	bp := copy(b, s)
-	copy(b[bp:], i)
+	copy(b, s)
+	copy(b[len(s):], i)
 	return b
+}
+
+// HasSeriesID reports whether f has a series id.
+func (f FieldKey) HasSeriesID() bool {
+	return f.SeriesID > 0
 }
 
 // MarshalToStr encodes f to string.
@@ -184,9 +191,9 @@ type PostingValue struct {
 	Term  []byte
 }
 
-// Writer allows writing fields and itemID in a document to a index.
+// Writer allows writing fields and docID in a document to a index.
 type Writer interface {
-	Write(fields []Field, itemID common.ItemID) error
+	Write(fields []Field, docID uint64) error
 }
 
 // FieldIterable allows building a FieldIterator.
@@ -205,10 +212,10 @@ type Searcher interface {
 
 // Store is an abstract of a index repository.
 type Store interface {
-	observability.Observable
 	io.Closer
 	Writer
 	Searcher
+	SizeOnDisk() int64
 }
 
 // GetSearcher returns a searcher associated with input index rule type.

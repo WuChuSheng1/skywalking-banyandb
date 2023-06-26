@@ -34,7 +34,6 @@ import (
 	"github.com/apache/skywalking-banyandb/api/common"
 	modelv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/model/v1"
 	"github.com/apache/skywalking-banyandb/banyand/kv"
-	"github.com/apache/skywalking-banyandb/banyand/observability"
 	"github.com/apache/skywalking-banyandb/pkg/convert"
 	"github.com/apache/skywalking-banyandb/pkg/logger"
 	pbv1 "github.com/apache/skywalking-banyandb/pkg/pb/v1"
@@ -92,7 +91,7 @@ func NewEntity(length int) Entity {
 }
 
 // EntityValue represents the value of a tag which is a part of an entity.
-type EntityValue *modelv1.TagValue
+type EntityValue = *modelv1.TagValue
 
 // EntityValueToEntry transforms EntityValue to Entry.
 func EntityValueToEntry(ev EntityValue) (Entry, error) {
@@ -248,11 +247,11 @@ func prepend(src []byte, entry []byte) []byte {
 
 // SeriesDatabase allows retrieving series.
 type SeriesDatabase interface {
-	observability.Observable
 	io.Closer
 	GetByID(id common.SeriesID) (Series, error)
 	Get(key []byte, entityValues EntityValues) (Series, error)
 	List(ctx context.Context, path Path) (SeriesList, error)
+	SizeOnDisk() int64
 }
 
 type blockDatabase interface {
@@ -273,6 +272,7 @@ type seriesDB struct {
 	seriesMetadata kv.Store
 	l              *logger.Logger
 	segCtrl        *segmentController
+	position       common.Position
 	sync.Mutex
 	sID common.ShardID
 }
@@ -324,8 +324,11 @@ func (s *seriesDB) Get(key []byte, entityValues EntityValues) (Series, error) {
 		}
 		errDecode = s.seriesMetadata.Put(entityKey, encodedData)
 		if errDecode != nil {
+			receivedNumCounter.Inc(1, append(s.position.ShardLabelValues(), "series", "true")...)
 			return nil, errDecode
 		}
+		receivedBytesCounter.Inc(float64(len(entityKey)+len(encodedData)), append(s.position.ShardLabelValues(), "series")...)
+		receivedNumCounter.Inc(1, append(s.position.ShardLabelValues(), "series", "false")...)
 
 		var series string
 		if e := s.l.Debug(); e.Enabled() {
@@ -349,6 +352,10 @@ func (s *seriesDB) Get(key []byte, entityValues EntityValues) (Series, error) {
 	}
 
 	return newSeries(s.context(), seriesID, entityValues.String(), s), nil
+}
+
+func (s *seriesDB) SizeOnDisk() int64 {
+	return s.seriesMetadata.SizeOnDisk()
 }
 
 func encode(seriesID common.SeriesID, evv EntityValues) ([]byte, []byte, error) {
@@ -404,6 +411,10 @@ func (s *seriesDB) List(ctx context.Context, path Path) (SeriesList, error) {
 	errScan := s.seriesMetadata.Scan(prefix, prepend(path.seekKey, entityPrefix), kv.DefaultScanOpts, func(key []byte, getVal func() ([]byte, error)) error {
 		key = key[entityPrefixLen:]
 		comparableKey := make([]byte, len(key))
+		// avoid slice out of bound
+		if len(key) > len(path.mask) {
+			return nil
+		}
 		for i, b := range key {
 			comparableKey[i] = path.mask[i] & b
 		}
@@ -485,26 +496,23 @@ func (s *seriesDB) context() context.Context {
 	return context.WithValue(context.Background(), logger.ContextKey, s.l)
 }
 
-func (s *seriesDB) Stats() observability.Statistics {
-	return s.seriesMetadata.Stats()
-}
-
 func (s *seriesDB) Close() error {
 	return s.seriesMetadata.Close()
 }
 
 func newSeriesDataBase(ctx context.Context, shardID common.ShardID, path string, segCtrl *segmentController) (SeriesDatabase, error) {
 	sdb := &seriesDB{
-		sID:     shardID,
-		segCtrl: segCtrl,
-		l:       logger.Fetch(ctx, "series_database"),
+		sID:      shardID,
+		segCtrl:  segCtrl,
+		l:        logger.Fetch(ctx, "series_database"),
+		position: common.GetPosition(ctx),
 	}
-	o := ctx.Value(optionsKey)
+	o := ctx.Value(OptionsKey)
 	var memSize int64
 	if o != nil {
 		options := o.(DatabaseOpts)
 		if options.SeriesMemSize > 1 {
-			memSize = options.SeriesMemSize
+			memSize = int64(options.SeriesMemSize)
 		} else {
 			memSize = defaultKVMemorySize
 		}

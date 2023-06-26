@@ -25,8 +25,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/apache/skywalking-banyandb/api/common"
 	"github.com/apache/skywalking-banyandb/banyand/kv"
-	"github.com/apache/skywalking-banyandb/banyand/observability"
 	"github.com/apache/skywalking-banyandb/banyand/tsdb/bucket"
 	"github.com/apache/skywalking-banyandb/pkg/logger"
 	"github.com/apache/skywalking-banyandb/pkg/timestamp"
@@ -40,6 +40,7 @@ type segment struct {
 	l                   *logger.Logger
 	blockController     *blockController
 	blockManageStrategy *bucket.Strategy
+	position            common.Position
 	timestamp.TimeRange
 	path      string
 	suffix    string
@@ -61,6 +62,7 @@ func openSegment(ctx context.Context, startTime, endTime time.Time, path, suffix
 		path:      path,
 		suffix:    suffix,
 		TimeRange: timeRange,
+		position:  common.GetPosition(ctx),
 	}
 	l := logger.Fetch(ctx, s.String())
 	s.l = l
@@ -77,7 +79,7 @@ func openSegment(ctx context.Context, startTime, endTime time.Time, path, suffix
 	if err != nil {
 		return nil, err
 	}
-	o := ctx.Value(optionsKey)
+	o := ctx.Value(OptionsKey)
 	if o != nil {
 		options := o.(DatabaseOpts)
 		if options.EnableGlobalIndex {
@@ -88,7 +90,7 @@ func openSegment(ctx context.Context, startTime, endTime time.Time, path, suffix
 			if s.globalIndex, err = kv.OpenStore(
 				indexPath,
 				kv.StoreWithLogger(s.l),
-				kv.StoreWithMemTableSize(memSize),
+				kv.StoreWithMemTableSize(int64(memSize)),
 			); err != nil {
 				return nil, err
 			}
@@ -135,11 +137,4 @@ func (s *segment) delete(ctx context.Context) error {
 
 func (s *segment) String() string {
 	return "SegID-" + s.suffix
-}
-
-func (s *segment) Stats() observability.Statistics {
-	if s.globalIndex == nil {
-		return observability.Statistics{}
-	}
-	return s.globalIndex.Stats()
 }

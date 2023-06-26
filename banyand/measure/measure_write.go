@@ -52,7 +52,7 @@ func (s *measure) write(shardID common.ShardID, entity []byte, entityValues tsdb
 	if fLen > len(s.schema.GetTagFamilies()) {
 		return errors.Wrap(errMalformedElement, "tag family number is more than expected")
 	}
-	shard, err := s.databaseSupplier.SupplyTSDB().Shard(shardID)
+	shard, err := s.databaseSupplier.SupplyTSDB().CreateShardsAndGetByID(shardID)
 	if err != nil {
 		return err
 	}
@@ -104,8 +104,8 @@ func (s *measure) write(shardID common.ShardID, entity []byte, entityValues tsdb
 			return nil, errWrite
 		}
 		_, errWrite = writer.Write()
-		if e := s.l.Named(s.schema.GetMetadata().GetGroup(), s.schema.GetMetadata().GetName()).Debug(); e.Enabled() {
-			e.Time("ts", t).
+		if s.l.Debug().Enabled() {
+			s.l.Debug().Time("ts", t).
 				Int("ts_nano", t.Nanosecond()).
 				RawJSON("data", logger.Proto(value)).
 				Uint64("series_id", uint64(series.ID())).
@@ -131,9 +131,12 @@ func (s *measure) write(shardID common.ShardID, entity []byte, entityValues tsdb
 	}
 	s.indexWriter.Write(m)
 	if s.processorManager != nil {
-		s.processorManager.onMeasureWrite(&measurev1.WriteRequest{
-			Metadata:  s.GetMetadata(),
-			DataPoint: value,
+		s.processorManager.onMeasureWrite(&measurev1.InternalWriteRequest{
+			Request: &measurev1.WriteRequest{
+				Metadata:  s.GetMetadata(),
+				DataPoint: value,
+			},
+			EntityValues: entityValues[1:],
 		})
 	}
 	return err
@@ -182,9 +185,9 @@ func encodeFieldValue(fieldValue *modelv1.FieldValue) []byte {
 	case *modelv1.FieldValue_Float:
 		return convert.Float64ToBytes(fieldValue.GetFloat().GetValue())
 	case *modelv1.FieldValue_Str:
-		return []byte(fieldValue.GetStr().Value)
+		return []byte(fieldValue.GetStr().GetValue())
 	case *modelv1.FieldValue_BinaryData:
-		return fieldValue.GetBinaryData()
+		return bytes.Clone(fieldValue.GetBinaryData())
 	}
 	return nil
 }

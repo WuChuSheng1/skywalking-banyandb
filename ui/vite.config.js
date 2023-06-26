@@ -49,6 +49,11 @@ export default defineConfig({
         target: "http://34.92.85.178:18913",
         changeOrigin: true,
       },
+      "^/monitoring": {
+        target: "http://localhost:2121",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/monitoring/, ''),
+      },
     },
   }
 })

@@ -21,14 +21,18 @@ package grpc
 import (
 	"context"
 	"net"
+	"runtime/debug"
 	"time"
 
-	grpc_validator "github.com/grpc-ecosystem/go-grpc-middleware/validator"
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/recovery"
+	grpc_validator "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/validator"
 	"github.com/pkg/errors"
 	grpclib "google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 
 	"github.com/apache/skywalking-banyandb/api/event"
 	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
@@ -37,55 +41,62 @@ import (
 	streamv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/stream/v1"
 	"github.com/apache/skywalking-banyandb/banyand/discovery"
 	"github.com/apache/skywalking-banyandb/banyand/metadata"
+	"github.com/apache/skywalking-banyandb/banyand/observability"
 	"github.com/apache/skywalking-banyandb/banyand/queue"
 	"github.com/apache/skywalking-banyandb/pkg/bus"
 	"github.com/apache/skywalking-banyandb/pkg/logger"
 	"github.com/apache/skywalking-banyandb/pkg/run"
 )
 
-const defaultRecvSize = 1024 * 1024 * 10
+const defaultRecvSize = 10 << 20
 
 var (
-	errServerCert = errors.New("invalid server cert file")
-	errServerKey  = errors.New("invalid server key file")
-	errNoAddr     = errors.New("no address")
-	errQueryMsg   = errors.New("invalid query message")
+	errServerCert        = errors.New("invalid server cert file")
+	errServerKey         = errors.New("invalid server key file")
+	errNoAddr            = errors.New("no address")
+	errQueryMsg          = errors.New("invalid query message")
+	errAccessLogRootPath = errors.New("access log root path is required")
 )
 
 type server struct {
 	pipeline queue.Queue
 	creds    credentials.TransportCredentials
 	repo     discovery.ServiceRepo
-	stopCh   chan struct{}
-	*measureRegistryServer
-	log *logger.Logger
-	ser *grpclib.Server
+	*indexRuleRegistryServer
+	measureSVC *measureService
+	log        *logger.Logger
+	ser        *grpclib.Server
 	*propertyServer
 	*topNAggregationRegistryServer
 	*groupRegistryServer
-	*indexRuleRegistryServer
-	streamSVC  *streamService
-	measureSVC *measureService
+	stopCh    chan struct{}
+	streamSVC *streamService
+	*measureRegistryServer
 	*streamRegistryServer
 	*indexRuleBindingRegistryServer
-	addr           string
-	keyFile        string
-	certFile       string
-	maxRecvMsgSize int
-	tls            bool
+	addr                     string
+	keyFile                  string
+	certFile                 string
+	accessLogRootPath        string
+	accessLogRecorders       []accessLogRecorder
+	maxRecvMsgSize           run.Bytes
+	tls                      bool
+	enableIngestionAccessLog bool
 }
 
 // NewServer returns a new gRPC server.
 func NewServer(_ context.Context, pipeline queue.Queue, repo discovery.ServiceRepo, schemaRegistry metadata.Service) run.Unit {
-	return &server{
-		pipeline: pipeline,
-		repo:     repo,
-		streamSVC: &streamService{
-			discoveryService: newDiscoveryService(pipeline),
-		},
-		measureSVC: &measureService{
-			discoveryService: newDiscoveryService(pipeline),
-		},
+	streamSVC := &streamService{
+		discoveryService: newDiscoveryService(pipeline),
+	}
+	measureSVC := &measureService{
+		discoveryService: newDiscoveryService(pipeline),
+	}
+	s := &server{
+		pipeline:   pipeline,
+		repo:       repo,
+		streamSVC:  streamSVC,
+		measureSVC: measureSVC,
 		streamRegistryServer: &streamRegistryServer{
 			schemaRegistry: schemaRegistry,
 		},
@@ -108,6 +119,8 @@ func NewServer(_ context.Context, pipeline queue.Queue, repo discovery.ServiceRe
 			schemaRegistry: schemaRegistry,
 		},
 	}
+	s.accessLogRecorders = []accessLogRecorder{streamSVC, measureSVC}
+	return s
 }
 
 func (s *server) PreRun() error {
@@ -141,6 +154,14 @@ func (s *server) PreRun() error {
 			return err
 		}
 	}
+
+	if s.enableIngestionAccessLog {
+		for _, alr := range s.accessLogRecorders {
+			if err := alr.activeIngestionAccessLog(s.accessLogRootPath); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -150,11 +171,14 @@ func (s *server) Name() string {
 
 func (s *server) FlagSet() *run.FlagSet {
 	fs := run.NewFlagSet("grpc")
-	fs.IntVarP(&s.maxRecvMsgSize, "max-recv-msg-size", "", defaultRecvSize, "the size of max receiving message")
+	s.maxRecvMsgSize = defaultRecvSize
+	fs.VarP(&s.maxRecvMsgSize, "max-recv-msg-size", "", "the size of max receiving message")
 	fs.BoolVarP(&s.tls, "tls", "", false, "connection uses TLS if true, else plain TCP")
 	fs.StringVarP(&s.certFile, "cert-file", "", "", "the TLS cert file")
 	fs.StringVarP(&s.keyFile, "key-file", "", "", "the TLS key file")
 	fs.StringVarP(&s.addr, "addr", "", ":17912", "the address of banyand listens")
+	fs.BoolVarP(&s.enableIngestionAccessLog, "enable-ingestion-access-log", "", false, "enable ingestion access log")
+	fs.StringVarP(&s.accessLogRootPath, "access-log-root-path", "", "", "access log root path")
 	return fs
 }
 
@@ -162,6 +186,10 @@ func (s *server) Validate() error {
 	if s.addr == "" {
 		return errNoAddr
 	}
+	if s.enableIngestionAccessLog && s.accessLogRootPath == "" {
+		return errAccessLogRootPath
+	}
+	observability.UpdateAddress("grpc", s.addr)
 	if !s.tls {
 		return nil
 	}
@@ -184,9 +212,31 @@ func (s *server) Serve() run.StopNotify {
 	if s.tls {
 		opts = []grpclib.ServerOption{grpclib.Creds(s.creds)}
 	}
-	opts = append(opts, grpclib.MaxRecvMsgSize(s.maxRecvMsgSize),
-		grpclib.UnaryInterceptor(grpc_validator.UnaryServerInterceptor()),
-		grpclib.StreamInterceptor(grpc_validator.StreamServerInterceptor()),
+	grpcPanicRecoveryHandler := func(p any) (err error) {
+		s.log.Error().Interface("panic", p).Str("stack", string(debug.Stack())).Msg("recovered from panic")
+
+		return status.Errorf(codes.Internal, "%s", p)
+	}
+
+	unaryMetrics, streamMetrics := observability.MetricsServerInterceptor()
+	streamChain := []grpclib.StreamServerInterceptor{
+		grpc_validator.StreamServerInterceptor(),
+		recovery.StreamServerInterceptor(recovery.WithRecoveryHandler(grpcPanicRecoveryHandler)),
+	}
+	if streamMetrics != nil {
+		streamChain = append(streamChain, streamMetrics)
+	}
+	unaryChain := []grpclib.UnaryServerInterceptor{
+		grpc_validator.UnaryServerInterceptor(),
+		recovery.UnaryServerInterceptor(recovery.WithRecoveryHandler(grpcPanicRecoveryHandler)),
+	}
+	if unaryMetrics != nil {
+		unaryChain = append(unaryChain, unaryMetrics)
+	}
+
+	opts = append(opts, grpclib.MaxRecvMsgSize(int(s.maxRecvMsgSize)),
+		grpclib.ChainUnaryInterceptor(unaryChain...),
+		grpclib.ChainStreamInterceptor(streamChain...),
 	)
 	s.ser = grpclib.NewServer(opts...)
 
@@ -199,6 +249,7 @@ func (s *server) Serve() run.StopNotify {
 	databasev1.RegisterStreamRegistryServiceServer(s.ser, s.streamRegistryServer)
 	databasev1.RegisterMeasureRegistryServiceServer(s.ser, s.measureRegistryServer)
 	propertyv1.RegisterPropertyServiceServer(s.ser, s.propertyServer)
+	databasev1.RegisterTopNAggregationRegistryServiceServer(s.ser, s.topNAggregationRegistryServer)
 	grpc_health_v1.RegisterHealthServer(s.ser, health.NewServer())
 
 	s.stopCh = make(chan struct{})
@@ -224,6 +275,11 @@ func (s *server) GracefulStop() {
 	stopped := make(chan struct{})
 	go func() {
 		s.ser.GracefulStop()
+		if s.enableIngestionAccessLog {
+			for _, alr := range s.accessLogRecorders {
+				_ = alr.Close()
+			}
+		}
 		close(stopped)
 	}()
 
@@ -236,4 +292,9 @@ func (s *server) GracefulStop() {
 		t.Stop()
 		s.log.Info().Msg("stopped gracefully")
 	}
+}
+
+type accessLogRecorder interface {
+	activeIngestionAccessLog(root string) error
+	Close() error
 }
