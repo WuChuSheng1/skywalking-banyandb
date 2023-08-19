@@ -19,7 +19,7 @@
 
 <script setup>
 import RigheMenu from '@/components/RightMenu/index.vue'
-import { getGroupList, getStreamOrMeasureList, deleteStreamOrMeasure, deleteGroup, createGroup, editGroup, createResources } from '@/api/index'
+import { deleteIndexRuleOrIndexRuleBinding, getindexRuleList, getindexRuleBindingList, getGroupList, getStreamOrMeasureList, deleteStreamOrMeasure, deleteGroup, createGroup, editGroup, createResources } from '@/api/index'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { watch, getCurrentInstance } from "@vue/runtime-core"
 import { useRouter, useRoute } from 'vue-router'
@@ -28,7 +28,6 @@ import { Search } from '@element-plus/icons-vue'
 const router = useRouter()
 const route = useRoute()
 const { proxy } = getCurrentInstance()
-const { ctx: that } = getCurrentInstance()
 
 // ref
 const ruleForm = ref()
@@ -57,10 +56,18 @@ const data = reactive({
     setGroup: 'create',
     groupForm: {
         name: null,
-        catalog: 'CATALOG_STREAM'
+        catalog: 'CATALOG_STREAM',
+        shardNum: 1,
+        blockIntervalUnit: "UNIT_UNSPECIFIED",
+        blockIntervalNum: 1,
+        segmentIntervalUnit: "UNIT_UNSPECIFIED",
+        segmentIntervalNum: 1,
+        ttlUnit: "UNIT_UNSPECIFIED",
+        ttlNum: 1
     },
     activeMenu: '',
-    search: ''
+    search: '',
+    formLabelWidth: "170px"
 })
 
 watch(() => data.search, () => {
@@ -77,10 +84,6 @@ const groupMenu = [
         icon: "el-icon-folder",
         name: "edit group",
         id: "edit Group"
-    }, {
-        icon: "el-icon-document",
-        name: "new resources",
-        id: "create resources"
     }, {
         icon: "el-icon-refresh-right",
         name: "refresh",
@@ -103,13 +106,62 @@ const resourceMenu = [
         id: "delete resources"
     }
 ]
+const StreamMenu = [
+    {
+        icon: "el-icon-document",
+        name: "new resources",
+        id: "create resources"
+    },
+]
+const indexRuleMenu = [
+    {
+        icon: "el-icon-document",
+        name: "new index-rule",
+        id: "create index-rule"
+    }
+]
+const indexRuleBindMenu = [
+    {
+        icon: "el-icon-document",
+        name: "new index-rule-binding",
+        id: "create index-rule-binding"
+    }
+]
+const indexRuleItemMenu = [
+    {
+        icon: "el-icon-document",
+        name: "edit index-rule",
+        id: "edit index-rule"
+    },
+    {
+        icon: "el-icon-delete",
+        name: "delete",
+        id: "delete index-rule"
+    }
+]
+const indexRuleBindingItemMenu = [
+    {
+        icon: "el-icon-document",
+        name: "edit index-rule-binding",
+        id: "edit index-rule-binding"
+    },
+    {
+        icon: "el-icon-delete",
+        name: "delete",
+        id: "delete index-rule-binding"
+    }
+]
 const menuItemFunction = {
     "new group": openCreateGroup,
     "edit group": openEditGroup,
     "new resources": openCreateResource,
-    "refresh": getGroupList,
+    "refresh": getGroupLists,
     "delete": openDeletaDialog,
-    "edit resources": openEditResource
+    "edit resources": openEditResource,
+    'new index-rule': openCreateIndexRuleOrIndexRuleBinding,
+    'edit index-rule': openEditIndexRuleOrIndexRuleBinding,
+    'new index-rule-binding': openCreateIndexRuleOrIndexRuleBinding,
+    'edit index-rule-binding': openEditIndexRuleOrIndexRuleBinding
 }
 
 // rules
@@ -122,6 +174,41 @@ const rules = {
     catalog: [
         {
             required: true, message: 'Please select the type of the group', trigger: 'blur'
+        }
+    ],
+    shardNum: [
+        {
+            required: true, message: 'Please select the shard num of the group', trigger: 'blur'
+        }
+    ],
+    blockIntervalUnit: [
+        {
+            required: true, message: 'Please select the block interval unit of the group', trigger: 'blur'
+        }
+    ],
+    blockIntervalNum: [
+        {
+            required: true, message: 'Please select the block Interval num of the group', trigger: 'blur'
+        }
+    ],
+    segmentIntervalUnit: [
+        {
+            required: true, message: 'Please select the segment interval unit of the group', trigger: 'blur'
+        }
+    ],
+    segmentIntervalNum: [
+        {
+            required: true, message: 'Please select the segment Interval num of the group', trigger: 'blur'
+        }
+    ],
+    ttlUnit: [
+        {
+            required: true, message: 'Please select the ttl unit of the group', trigger: 'blur'
+        }
+    ],
+    ttlNum: [
+        {
+            required: true, message: 'Please select the ttl num of the group', trigger: 'blur'
         }
     ]
 }
@@ -170,7 +257,6 @@ function searchGroup() {
         }
     })
     data.groupLists = JSON.parse(JSON.stringify(groupLists))
-    that.$forceUpdate()
 }
 // init data
 function getGroupLists() {
@@ -199,10 +285,43 @@ function getGroupLists() {
                             })
                     })
                 })
+                if (props.type == 'stream') {
+                    let promiseIndexRule = data.groupLists.map((item) => {
+                        let name = item.metadata.name
+                        return new Promise((resolve, reject) => {
+                            getindexRuleList(name)
+                                .then(res => {
+                                    if (res.status == 200) {
+                                        item.indexRule = res.data.indexRule
+                                        resolve()
+                                    }
+                                })
+                                .catch((err) => {
+                                    reject(err)
+                                })
+                        })
+                    })
+                    let promiseIndexRuleBinding = data.groupLists.map((item) => {
+                        let name = item.metadata.name
+                        return new Promise((resolve, reject) => {
+                            getindexRuleBindingList(name)
+                                .then(res => {
+                                    if (res.status == 200) {
+                                        item.indexRuleBinding = res.data.indexRuleBinding
+                                        resolve()
+                                    }
+                                })
+                                .catch((err) => {
+                                    reject(err)
+                                })
+                        })
+                    })
+                    promise = promise.concat(promiseIndexRule)
+                    promise = promise.concat(promiseIndexRuleBinding)
+                }
                 Promise.all(promise).then(() => {
                     data.showSearch = true
                     data.groupListsCopy = JSON.parse(JSON.stringify(data.groupLists))
-                    that.$forceUpdate()
                 }).catch((err) => {
                     ElMessage({
                         message: 'An error occurred while obtaining group data. Please refresh and try again. Error: ' + err,
@@ -283,6 +402,13 @@ function shrinkDown(e) {
 // right click menu
 function rightClickGroup(e, index) {
     data.rightMenuList = groupMenu
+    if (props.type == 'measure') {
+        data.rightMenuList.push({
+            icon: "el-icon-document",
+            name: "new resources",
+            id: "create resources"
+        })
+    }
     data.clickIndex = index
     data.rightClickType = 'group'
     openRightMenu(e)
@@ -292,6 +418,38 @@ function rightClickResources(e, index, childIndex) {
     data.clickIndex = index
     data.clickChildIndex = childIndex
     data.rightClickType = 'resources'
+    openRightMenu(e)
+}
+function rightClickStream(e, index) {
+    data.rightMenuList = StreamMenu
+    data.clickIndex = index
+    data.rightClickType = 'group'
+    openRightMenu(e)
+}
+function rightClickIndexRule(e, index) {
+    data.rightMenuList = indexRuleMenu
+    data.clickIndex = index
+    data.rightClickType = 'index-rule'
+    openRightMenu(e)
+}
+function rightClickIndexRuleBinding(e, index) {
+    data.rightMenuList = indexRuleBindMenu
+    data.clickIndex = index
+    data.rightClickType = 'index-rule-binding'
+    openRightMenu(e)
+}
+function rightClickIndexRuleItem(e, index, childIndex) {
+    data.rightMenuList = indexRuleItemMenu
+    data.clickIndex = index
+    data.clickChildIndex = childIndex
+    data.rightClickType = 'index-rule'
+    openRightMenu(e)
+}
+function rightClickIndexRuleBindingItem(e, index, childIndex) {
+    data.rightMenuList = indexRuleBindingItemMenu
+    data.clickIndex = index
+    data.clickChildIndex = childIndex
+    data.rightClickType = 'index-rule-binding'
     openRightMenu(e)
 }
 function openRightMenu(e) {
@@ -320,6 +478,73 @@ function stopPropagation(e) {
 }
 
 // CRUD operator
+function openCreateIndexRuleOrIndexRuleBinding() {
+    const route = {
+        name: `create-${data.rightClickType}`,
+        params: {
+            operator: 'create',
+            group: data.groupLists[data.clickIndex].metadata.name,
+            name: '',
+            type: data.rightClickType
+        }
+    }
+    router.push(route)
+    const add = {
+        label: data.groupLists[data.clickIndex].metadata.name,
+        type: `Create-${data.rightClickType}`,
+        route
+    }
+    data.activeMenu = ''
+    $bus.emit('AddTabs', add)
+}
+
+function openEditIndexRuleOrIndexRuleBinding() {
+    const typeFlag = {
+        'index-rule': 'indexRule',
+        'index-rule-binding': 'indexRuleBinding'
+    }
+    const route = {
+        name: `edit-${data.rightClickType}`,
+        params: {
+            operator: 'edit',
+            group: data.groupLists[data.clickIndex].metadata.name,
+            name: data.groupLists[data.clickIndex][typeFlag[data.rightClickType]][data.clickChildIndex].metadata.name,
+            type: data.rightClickType
+        }
+    }
+    router.push(route)
+    const add = {
+        label: data.groupLists[data.clickIndex][typeFlag[data.rightClickType]][data.clickChildIndex].metadata.name,
+        type: `Edit-${data.rightClickType}`,
+        route
+    }
+    $bus.emit('AddTabs', add)
+}
+function openIndexRuleOrIndexRuleBinding(index, childIndex, type) {
+    const typeFlag = {
+        'indexRule': 'index-rule',
+        'indexRuleBinding': 'index-rule-binding'
+    }
+    const group = data.groupLists[index][type][childIndex].metadata.group
+    const name = data.groupLists[index][type][childIndex].metadata.name
+    const route = {
+        name: `${typeFlag[type]}`,
+        params: {
+            group: group,
+            name: name,
+            operator: 'read',
+            type: typeFlag[type]
+        }
+    }
+    router.push(route)
+    const add = {
+        label: name,
+        type: `Read-${typeFlag[type]}`,
+        route
+    }
+    data.activeMenu = `${group}-${name}`
+    $bus.emit('AddTabs', add)
+}
 function openCreateGroup() {
     data.setGroup = 'create'
     data.dialogGroupVisible = true
@@ -327,6 +552,13 @@ function openCreateGroup() {
 function openEditGroup() {
     data.groupForm.name = data.groupLists[data.clickIndex].metadata.name
     data.groupForm.catalog = data.groupLists[data.clickIndex].catalog
+    data.groupForm.shardNum = data.groupLists[data.clickIndex].resourceOpts?.shardNum
+    data.groupForm.blockIntervalUnit = data.groupLists[data.clickIndex].resourceOpts?.blockInterval?.unit
+    data.groupForm.blockIntervalNum = data.groupLists[data.clickIndex].resourceOpts?.blockInterval?.num
+    data.groupForm.segmentIntervalUnit = data.groupLists[data.clickIndex].resourceOpts?.segmentInterval?.unit
+    data.groupForm.segmentIntervalNum = data.groupLists[data.clickIndex].resourceOpts?.segmentInterval?.num
+    data.groupForm.ttlUnit = data.groupLists[data.clickIndex].resourceOpts?.ttl?.unit
+    data.groupForm.ttlNum = data.groupLists[data.clickIndex].resourceOpts?.ttl?.num
     data.dialogGroupVisible = true
     data.setGroup = 'edit'
 }
@@ -368,16 +600,46 @@ function openEditResource() {
     $bus.emit('AddTabs', add)
 }
 function openDeletaDialog() {
-    ElMessageBox.confirm('Are you sure to delete this resource?')
+    ElMessageBox.confirm('Are you sure to delete?')
         .then(() => {
             let group = data.groupLists[data.clickIndex].metadata.name
             if (data.rightClickType == 'group') {
                 return deleteGroupFunction(group)
+            } else if (data.rightClickType == 'index-rule') {
+                return deleteIndexRuleOrIndexRuleBindingFunction("index-rule")
+            } else if (data.rightClickType == 'index-rule-binding') {
+                return deleteIndexRuleOrIndexRuleBindingFunction("index-rule-binding")
             }
             return deleteResource(group)
         })
         .catch(() => {
             // catch error
+        })
+}
+function deleteIndexRuleOrIndexRuleBindingFunction(type) {
+    $loadingCreate()
+    const flag = {
+        'index-rule': 'indexRule',
+        'index-rule-binding': 'indexRuleBinding'
+    }
+    let group = data.groupLists[data.clickIndex].metadata.name
+    let name = data.groupLists[data.clickIndex][flag[type]][data.clickChildIndex].metadata.name
+    deleteIndexRuleOrIndexRuleBinding(type, group, name)
+        .then((res) => {
+            if (res.status == 200) {
+                if (res.data.deleted) {
+                    ElMessage({
+                        message: 'Delete succeeded',
+                        type: "success",
+                        duration: 5000
+                    })
+                    getGroupLists()
+                    $bus.emit('deleteResource', name)
+                }
+            }
+        })
+        .finally(() => {
+            $loadingClose()
         })
 }
 function deleteGroupFunction(group) {
@@ -437,7 +699,22 @@ function createGroupFunction() {
                         group: "",
                         name: data.groupForm.name
                     },
-                    catalog: data.groupForm.catalog
+                    catalog: data.groupForm.catalog,
+                    resourceOpts: {
+                        shardNum: data.groupForm.shardNum,
+                        blockInterval: {
+                            unit: data.groupForm.blockIntervalUnit,
+                            num: data.groupForm.blockIntervalNum
+                        },
+                        segmentInterval: {
+                            unit: data.groupForm.segmentIntervalUnit,
+                            num: data.groupForm.segmentIntervalNum
+                        },
+                        ttl: {
+                            unit: data.groupForm.ttlUnit,
+                            num: data.groupForm.ttlNum
+                        }
+                    }
                 }
             }
             $loadingCreate()
@@ -469,7 +746,22 @@ function editGroupFunction() {
                         group: "",
                         name: data.groupForm.name
                     },
-                    catalog: data.groupForm.catalog
+                    catalog: data.groupForm.catalog,
+                    resourceOpts: {
+                        shardNum: data.groupForm.shardNum,
+                        blockInterval: {
+                            unit: data.groupForm.blockIntervalUnit,
+                            num: data.groupForm.blockIntervalNum
+                        },
+                        segmentInterval: {
+                            unit: data.groupForm.segmentIntervalUnit,
+                            num: data.groupForm.segmentIntervalNum
+                        },
+                        ttl: {
+                            unit: data.groupForm.ttlUnit,
+                            num: data.groupForm.ttlNum
+                        }
+                    }
                 }
             }
             $loadingCreate()
@@ -499,7 +791,14 @@ function cancelCreateEditDialog() {
 function clearGroupForm() {
     data.groupForm = {
         name: null,
-        catalog: 'CATALOG_STREAM'
+        catalog: 'CATALOG_STREAM',
+        shardNum: 1,
+        blockIntervalUnit: "UNIT_UNSPECIFIED",
+        blockIntervalNum: 1,
+        segmentIntervalUnit: "UNIT_UNSPECIFIED",
+        segmentIntervalNum: 1,
+        ttlUnit: "UNIT_UNSPECIFIED",
+        ttlNum: 1
     }
 }
 function initActiveMenu() {
@@ -537,8 +836,8 @@ initActiveMenu()
 <template>
     <div style="display: flex; flex-direction: column; width: 100%;">
         <div class="size flex" style="display: flex; flex-direction: column; width: 100%;">
-            <el-input v-if="data.showSearch" class="aside-search" v-model="data.search" placeholder="Search"
-                :prefix-icon="Search" clearable />
+            <el-input v-if="data.showSearch && props.type == 'measure'" class="aside-search" v-model="data.search"
+                placeholder="Search" :prefix-icon="Search" clearable />
             <el-menu v-if="data.groupLists.length > 0" :collapse="data.isCollapse" :default-active="data.activeMenu">
                 <div v-for="(item, index) in data.groupLists" :key="item.metadata.name"
                     @contextmenu.prevent="rightClickGroup($event, index)">
@@ -551,20 +850,106 @@ initActiveMenu()
                                 {{ item.metadata.name }}
                             </span>
                         </template>
-                        <div v-for="(child, childIndex) in item.children" :key="child.metadata.name">
-                            <div @contextmenu.prevent="rightClickResources($event, index, childIndex)">
-                                <el-menu-item :index="`${child.metadata.group}-${child.metadata.name}`"
-                                    @click="openResources(index, childIndex)">
-                                    <template #title>
-                                        <el-icon>
-                                            <Document />
-                                        </el-icon>
-                                        <span slot="title" :title="child.metadata.name" style="width: 90%"
-                                            class="text-overflow-hidden">
-                                            {{ child.metadata.name }}
-                                        </span>
-                                    </template>
-                                </el-menu-item>
+                        <el-sub-menu v-if="props.type == 'stream'" :index="`${item.metadata.name}-${index}-index-rule`"
+                            @contextmenu.prevent="rightClickIndexRule($event, index)">
+                            <template #title>
+                                <el-icon>
+                                    <Folder />
+                                </el-icon>
+                                <span slot="title" title="Index-Rule" style="width: 70%" class="text-overflow-hidden">
+                                    Index-Rule
+                                </span>
+                            </template>
+                            <div v-for="(child, childIndex) in item.indexRule" :key="child.metadata.name">
+                                <div @contextmenu.prevent="rightClickIndexRuleItem($event, index, childIndex)">
+                                    <el-menu-item @click="openIndexRuleOrIndexRuleBinding(index, childIndex, 'indexRule')"
+                                        :index="`${child.metadata.group}-${child.metadata.name}`">
+                                        <template #title>
+                                            <el-icon>
+                                                <Document />
+                                            </el-icon>
+                                            <span slot="title" :title="child.metadata.name" style="width: 90%"
+                                                class="text-overflow-hidden">
+                                                {{ child.metadata.name }}
+                                            </span>
+                                        </template>
+                                    </el-menu-item>
+                                </div>
+                            </div>
+                        </el-sub-menu>
+                        <el-sub-menu v-if="props.type == 'stream'"
+                            :index="`${item.metadata.name}-${index}-index-rule-binding`"
+                            @contextmenu.prevent="rightClickIndexRuleBinding($event, index)">
+                            <template #title>
+                                <el-icon>
+                                    <Folder />
+                                </el-icon>
+                                <span slot="title" title="Index-Rule-Binding" style="width: 70%"
+                                    class="text-overflow-hidden">
+                                    Index-Rule-Binding
+                                </span>
+                            </template>
+                            <div v-for="(child, childIndex) in item.indexRuleBinding" :key="child.metadata.name">
+                                <div @contextmenu.prevent="rightClickIndexRuleBindingItem($event, index, childIndex)">
+                                    <el-menu-item
+                                        @click="openIndexRuleOrIndexRuleBinding(index, childIndex, 'indexRuleBinding')"
+                                        :index="`${child.metadata.group}-${child.metadata.name}`">
+                                        <template #title>
+                                            <el-icon>
+                                                <Document />
+                                            </el-icon>
+                                            <span slot="title" :title="child.metadata.name" style="width: 90%"
+                                                class="text-overflow-hidden">
+                                                {{ child.metadata.name }}
+                                            </span>
+                                        </template>
+                                    </el-menu-item>
+                                </div>
+                            </div>
+                        </el-sub-menu>
+                        <el-sub-menu v-if="props.type == 'stream'" @contextmenu.prevent="rightClickStream($event, index)"
+                            :index="`${item.metadata.name}-${index}-stream`">
+                            <template #title>
+                                <el-icon>
+                                    <Folder />
+                                </el-icon>
+                                <span slot="title" title="Stream" style="width: 70%" class="text-overflow-hidden">
+                                    Stream
+                                </span>
+                            </template>
+                            <div v-for="(child, childIndex) in item.children" :key="child.metadata.name">
+                                <div @contextmenu.prevent="rightClickResources($event, index, childIndex)">
+                                    <el-menu-item :index="`${child.metadata.group}-${child.metadata.name}`"
+                                        @click="openResources(index, childIndex)">
+                                        <template #title>
+                                            <el-icon>
+                                                <Document />
+                                            </el-icon>
+                                            <span slot="title" :title="child.metadata.name" style="width: 90%"
+                                                class="text-overflow-hidden">
+                                                {{ child.metadata.name }}
+                                            </span>
+                                        </template>
+                                    </el-menu-item>
+                                </div>
+                            </div>
+                        </el-sub-menu>
+                        <div v-if="props.type == 'measure'">
+                            <div v-for="(child, childIndex) in item.children" :key="child.metadata.name">
+                                <div @contextmenu.prevent="rightClickResources($event, index, childIndex)">
+                                    <el-menu-item :index="`${child.metadata.group}-${child.metadata.name}`"
+                                        @click="openResources(index, childIndex)">
+                                        <template #title>
+                                            <el-icon>
+                                                <Document />
+                                            </el-icon>
+                                            <span slot="title" :title="child.metadata.name" style="width: 90%"
+                                                class="text-overflow-hidden">
+                                                {{ child.metadata.name }}
+                                            </span>
+                                        </template>
+                                    </el-menu-item>
+                                </div>
                             </div>
                         </div>
                     </el-sub-menu>
@@ -581,15 +966,48 @@ initActiveMenu()
         <el-dialog width="25%" center :title="`${data.setGroup} group`" v-model="data.dialogGroupVisible"
             :show-close="false">
             <el-form ref="ruleForm" :rules="rules" :model="data.groupForm" label-position="left">
-                <el-form-item label="group name" label-width="120px" prop="name">
+                <el-form-item label="group name" :label-width="data.formLabelWidth" prop="name">
                     <el-input :disabled="data.setGroup == 'edit'" v-model="data.groupForm.name" autocomplete="off">
                     </el-input>
                 </el-form-item>
-                <el-form-item label="group type" label-width="120px" prop="catalog">
+                <el-form-item label="group type" :label-width="data.formLabelWidth" prop="catalog">
                     <el-select v-model="data.groupForm.catalog" placeholder="please select" style="width: 100%">
                         <el-option label="CATALOG_STREAM" value="CATALOG_STREAM"></el-option>
                         <el-option label="CATALOG_MEASURE" value="CATALOG_MEASURE"></el-option>
                     </el-select>
+                </el-form-item>
+                <el-form-item label="shard num" :label-width="data.formLabelWidth" prop="shardNum">
+                    <el-input-number v-model="data.groupForm.shardNum" :min="1" />
+                </el-form-item>
+                <el-form-item label="block interval unit" :label-width="data.formLabelWidth" prop="blockIntervalUnit">
+                    <el-select v-model="data.groupForm.blockIntervalUnit" placeholder="please select" style="width: 100%">
+                        <el-option label="UNIT_UNSPECIFIED" value="UNIT_UNSPECIFIED"></el-option>
+                        <el-option label="UNIT_HOUR" value="UNIT_HOUR"></el-option>
+                        <el-option label="UNIT_DAY" value="UNIT_DAY"></el-option>
+                    </el-select>
+                </el-form-item>
+                <el-form-item label="block interval num" :label-width="data.formLabelWidth" prop="blockIntervalNum">
+                    <el-input-number v-model="data.groupForm.blockIntervalNum" :min="1" />
+                </el-form-item>
+                <el-form-item label="segment interval unit" :label-width="data.formLabelWidth" prop="segmentIntervalUnit">
+                    <el-select v-model="data.groupForm.segmentIntervalUnit" placeholder="please select" style="width: 100%">
+                        <el-option label="UNIT_UNSPECIFIED" value="UNIT_UNSPECIFIED"></el-option>
+                        <el-option label="UNIT_HOUR" value="UNIT_HOUR"></el-option>
+                        <el-option label="UNIT_DAY" value="UNIT_DAY"></el-option>
+                    </el-select>
+                </el-form-item>
+                <el-form-item label="segment interval num" :label-width="data.formLabelWidth" prop="segmentIntervalNum">
+                    <el-input-number v-model="data.groupForm.segmentIntervalNum" :min="1" />
+                </el-form-item>
+                <el-form-item label="ttl unit" :label-width="data.formLabelWidth" prop="ttlUnit">
+                    <el-select v-model="data.groupForm.ttlUnit" placeholder="please select" style="width: 100%">
+                        <el-option label="UNIT_UNSPECIFIED" value="UNIT_UNSPECIFIED"></el-option>
+                        <el-option label="UNIT_HOUR" value="UNIT_HOUR"></el-option>
+                        <el-option label="UNIT_DAY" value="UNIT_DAY"></el-option>
+                    </el-select>
+                </el-form-item>
+                <el-form-item label="ttl num" :label-width="data.formLabelWidth" prop="ttlNum">
+                    <el-input-number v-model="data.groupForm.ttlNum" :min="1" />
                 </el-form-item>
             </el-form>
             <div slot="footer" class="dialog-footer footer">
