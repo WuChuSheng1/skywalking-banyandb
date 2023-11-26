@@ -2,6 +2,26 @@
 
 Release Notes.
 
+## 0.6.0
+
+### Features
+
+- Support etcd client authentication.
+- Implement Local file system.
+- Add health check command for bydbctl
+
+### Bugs
+
+- Fix the bug that property merge new tags failed.
+
+
+### Chores
+
+- Bump go to 1.21.
+- Bump node to 20.9.
+- Bump several tools.
+- Bump all dependencies of Go and Node.
+
 ## 0.5.0
 
 ### Features
@@ -12,6 +32,12 @@ Release Notes.
 - Support multiple roles for banyand server.
 - Support for recovery buffer using wal.
 - Register the node role to the metadata registry.
+- Implement the remote queue to spreading data to data nodes.
+- Implement the distributed query engine.
+- Add mod revision check to write requests.
+- Add TTL to the property.
+- Implement node selector (e.g. PickFirst Selector, Maglev Selector).
+- Unified the buffers separated in blocks to a single buffer in the shard.
 
 ### Bugs
 
@@ -20,6 +46,8 @@ Release Notes.
 - Fix timer not released
 - BanyanDB ui misses fields when creating a group
 - Fix data duplicate writing
+- Syncing metadata change events from etcd instead of a local channel.
+- Fix parse environment variables error
 
 ### Chores
 

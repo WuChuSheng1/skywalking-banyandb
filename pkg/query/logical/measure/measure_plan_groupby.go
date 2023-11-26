@@ -18,6 +18,7 @@
 package measure
 
 import (
+	"context"
 	"fmt"
 	"math"
 
@@ -101,14 +102,14 @@ func (g *groupBy) Schema() logical.Schema {
 	return g.schema.ProjTags(g.groupByTagsRefs...)
 }
 
-func (g *groupBy) Execute(ec executor.MeasureExecutionContext) (executor.MIterator, error) {
+func (g *groupBy) Execute(ec context.Context) (executor.MIterator, error) {
 	if g.groupByEntity {
 		return g.sort(ec)
 	}
 	return g.hash(ec)
 }
 
-func (g *groupBy) sort(ec executor.MeasureExecutionContext) (executor.MIterator, error) {
+func (g *groupBy) sort(ec context.Context) (executor.MIterator, error) {
 	iter, err := g.Parent.Input.(executor.MeasureExecutable).Execute(ec)
 	if err != nil {
 		return nil, err
@@ -116,7 +117,7 @@ func (g *groupBy) sort(ec executor.MeasureExecutionContext) (executor.MIterator,
 	return newGroupSortIterator(iter, g.groupByTagsRefs), nil
 }
 
-func (g *groupBy) hash(ec executor.MeasureExecutionContext) (mit executor.MIterator, err error) {
+func (g *groupBy) hash(ec context.Context) (mit executor.MIterator, err error) {
 	iter, err := g.Parent.Input.(executor.MeasureExecutable).Execute(ec)
 	if err != nil {
 		return nil, err
@@ -153,6 +154,12 @@ func formatGroupByKey(point *measurev1.DataPoint, groupByTagsRefs [][]*logical.T
 	hash := xxhash.New()
 	for _, tagFamilyRef := range groupByTagsRefs {
 		for _, tagRef := range tagFamilyRef {
+			if tagRef.Spec.TagFamilyIdx >= len(point.GetTagFamilies()) {
+				return 0, errors.New("tag family index out of range")
+			}
+			if tagRef.Spec.TagIdx >= len(point.GetTagFamilies()[tagRef.Spec.TagFamilyIdx].GetTags()) {
+				return 0, errors.New("tag index out of range")
+			}
 			tag := point.GetTagFamilies()[tagRef.Spec.TagFamilyIdx].GetTags()[tagRef.Spec.TagIdx]
 			switch v := tag.GetValue().GetValue().(type) {
 			case *modelv1.TagValue_Str:

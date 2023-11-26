@@ -1,6 +1,10 @@
 # BanyanDB
 
-![](https://github.com/apache/skywalking-banyandb/workflows/Build/badge.svg?branch=main)
+[![Continuous Integration](https://github.com/apache/skywalking-banyandb/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/apache/skywalking-banyandb/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/apache/skywalking-banyandb)](https://goreportcard.com/report/github.com/apache/skywalking-banyandb)
+[![GitHub release](https://img.shields.io/github/tag/apache/skywalking-banyandb.svg?label=release)](https://github.com/apache/skywalking-banyandb/releases)
+[![GitHub release date](https://img.shields.io/github/release-date/apache/skywalking-banyandb.svg)](https://github.com/apache/skywalking-banyandb/releases)
+[![GoDoc](https://img.shields.io/badge/Godoc-reference-blue.svg)](https://godoc.org/github.com/apache/skywalking-banyandb)
 
 ![](./assets/banyandb_small.jpg)
 
@@ -13,6 +17,14 @@ BanyanDB, as an observability database, aims to ingest, analyze and store Metric
 
 The database research community usually uses [RUM conjecture](http://daslab.seas.harvard.edu/rum-conjecture/) to describe how a database access data. BanyanDB combines several access methods to build a comprehensive APM database to balance read cost, update cost, and memory overhead.
 
+## Contact us
+
+* Submit [an issue](https://github.com/apache/skywalking/issues/new) by selecting the [BanyanDB](https://github.com/apache/skywalking/issues?q=is%3Aopen+is%3Aissue+label%3Adatabase) component.
+* Mail list: **dev@skywalking.apache.org**. Mail to dev-subscribe@skywalking.apache.org, follow the reply to subscribe the mail list.
+* Send `Request to join SkyWalking slack` mail to the mail list(`dev@skywalking.apache.org`), we will invite you in.
+* For Chinese speaker, send `[CN] Request to join SkyWalking slack` mail to the mail list(`dev@skywalking.apache.org`), we will invite you in.
+* X (Twitter): [@BanyanDB](https://twitter.com/BanyanDB) and [@ASFSkyWalking](https://twitter.com/ASFSkyWalking)
+
 ## Documents
 
 [Documents](https://skywalking.apache.org/docs/skywalking-banyandb/next/readme/)
@@ -24,12 +36,12 @@ The database research community usually uses [RUM conjecture](http://daslab.seas
 - [x] gRPC server
 - [x] HTTP server
 
-### Distributed manager (v1.0.0)
+### Distributed manager
 
-- [ ] Sharding
-- [ ] Load balance
-- [ ] Distributed query optimizer
-- [ ] Data queue
+- [x] Sharding
+- [x] Load balance
+- [x] Distributed query optimizer
+- [x] Data queue
 
 ### Data processor
 
@@ -42,7 +54,7 @@ The database research community usually uses [RUM conjecture](http://daslab.seas
 - [x] Index processor
 - [x] TTL
 - [x] Cold data processor
-- [ ] WAL (v0.5.0)
+- [x] WAL
 
 ### Query processor
 
@@ -53,15 +65,11 @@ The database research community usually uses [RUM conjecture](http://daslab.seas
 - [ ] Parallel executor
 - [ ] Cost-based optimizer
 
-### Verification
+### Storage
 
-- [x] E2E with OAP and simulated data
-- [x] E2E with showcases, agents and OAP
-- [x] Space utilization rate
-- [ ] Leading and trailing zero (v0.5.0)
-- [ ] Stability (v0.5.0)
-- [ ] Crash recovery (v0.5.0)
-- [ ] Performance
+- [ ] Compaction
+- [ ] Merge data files
+- [ ] Sparse index
 
 ### Tools
 
@@ -74,4 +82,4 @@ For developers who want to contribute to this project, see the [Contribution Gui
 
 ## License
 
-[Apache 2.0 License.](/LICENSE)
+[Apache 2.0 License.](LICENSE)

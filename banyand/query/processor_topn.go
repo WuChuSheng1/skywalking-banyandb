@@ -18,29 +18,24 @@
 package query
 
 import (
-	"bytes"
 	"container/heap"
 	"context"
+	"slices"
 	"time"
 
-	"github.com/pkg/errors"
-	"golang.org/x/exp/slices"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
+	"github.com/apache/skywalking-banyandb/api/common"
 	measurev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/measure/v1"
 	modelv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/model/v1"
 	"github.com/apache/skywalking-banyandb/banyand/measure"
 	"github.com/apache/skywalking-banyandb/banyand/tsdb"
 	"github.com/apache/skywalking-banyandb/pkg/bus"
-	"github.com/apache/skywalking-banyandb/pkg/convert"
 	"github.com/apache/skywalking-banyandb/pkg/flow"
-	"github.com/apache/skywalking-banyandb/pkg/flow/streaming"
 	"github.com/apache/skywalking-banyandb/pkg/logger"
-	pbv1 "github.com/apache/skywalking-banyandb/pkg/pb/v1"
 	"github.com/apache/skywalking-banyandb/pkg/query/aggregation"
-	"github.com/apache/skywalking-banyandb/pkg/timestamp"
+	"github.com/apache/skywalking-banyandb/pkg/query/executor"
+	logical_measure "github.com/apache/skywalking-banyandb/pkg/query/logical/measure"
 )
 
 type topNQueryProcessor struct {
@@ -50,9 +45,14 @@ type topNQueryProcessor struct {
 
 func (t *topNQueryProcessor) Rev(message bus.Message) (resp bus.Message) {
 	request, ok := message.Data().(*measurev1.TopNRequest)
+	now := time.Now().UnixNano()
 	if !ok {
 		t.log.Warn().Msg("invalid event data type")
 		return
+	}
+	ml := t.log.Named("topn", request.Metadata.Group, request.Metadata.Name)
+	if e := ml.Debug(); e.Enabled() {
+		e.RawJSON("req", logger.Proto(request)).Msg("received a topn event")
 	}
 	if request.GetFieldValueSort() == modelv1.Sort_SORT_UNSPECIFIED {
 		t.log.Warn().Msg("invalid requested sort direction")
@@ -81,157 +81,68 @@ func (t *topNQueryProcessor) Rev(message bus.Message) (resp bus.Message) {
 			Msg("fail to find source measure")
 		return
 	}
-	shards, err := sourceMeasure.CompanionShards(topNMetadata)
+
+	schema, err := t.metaService.MeasureRegistry().GetMeasure(context.TODO(), topNMetadata)
 	if err != nil {
 		t.log.Error().Err(err).
 			Str("topN", topNMetadata.GetName()).
-			Msg("fail to list shards")
+			Msg("fail to find topN measure")
 		return
 	}
-	aggregator := createTopNPostAggregator(request.GetTopN(),
-		request.GetAgg(), request.GetFieldValueSort())
-	entity, err := locateEntity(topNSchema, request.GetFieldValueSort(), request.GetConditions())
+
+	sourceMeasure.SetSchema(schema)
+	s, err := logical_measure.BuildTopNSchema(schema, topNSchema.GetGroupByTagNames())
 	if err != nil {
 		t.log.Error().Err(err).
 			Str("topN", topNMetadata.GetName()).
-			Msg("fail to parse entity")
+			Msg("fail to build schema")
+	}
+	plan, err := logical_measure.TopNAnalyze(context.TODO(), request, schema, topNSchema, s)
+	if err != nil {
+		resp = bus.NewMessage(bus.MessageID(now), common.NewError("fail to analyze the query request for topn %s: %v", topNMetadata.GetName(), err))
 		return
 	}
-	for _, shard := range shards {
-		// TODO: support condition
-		sl, innerErr := shard.Series().List(context.WithValue(
-			context.Background(),
-			logger.ContextKey,
-			t.log,
-		), tsdb.NewPath(entity))
-		if innerErr != nil {
-			t.log.Error().Err(innerErr).
-				Str("topN", topNMetadata.GetName()).
-				Msg("fail to list series")
-			return
+
+	if e := ml.Debug(); e.Enabled() {
+		e.Str("plan", plan.String()).Msg("topn plan")
+	}
+
+	mIterator, err := plan.(executor.MeasureExecutable).Execute(executor.WithMeasureExecutionContext(context.Background(), sourceMeasure))
+	if err != nil {
+		ml.Error().Err(err).RawJSON("req", logger.Proto(request)).Msg("fail to close the topn plan")
+		resp = bus.NewMessage(bus.MessageID(now), common.NewError("fail to execute the topn plan for measure %s: %v", topNMetadata.GetName(), err))
+	}
+	defer func() {
+		if err = mIterator.Close(); err != nil {
+			ml.Error().Err(err).RawJSON("req", logger.Proto(request))
 		}
-		for _, series := range sl {
-			iters, scanErr := t.scanSeries(series, request)
-			if scanErr != nil {
-				t.log.Error().Err(innerErr).
-					Str("topN", topNMetadata.GetName()).
-					Msg("fail to scan series")
-				return
-			}
-			if len(iters) < 1 {
-				continue
-			}
-			for _, iter := range iters {
-				for iter.Next() {
-					tuple, parseErr := parseTopNFamily(iter.Val(), sourceMeasure.GetInterval())
-					if parseErr != nil {
-						t.log.Error().Err(parseErr).
-							Str("topN", topNMetadata.GetName()).
-							Msg("fail to parse topN family")
-						return
-					}
-					_ = aggregator.put(tuple.V1.([]*modelv1.TagValue), tuple.V2.(int64), iter.Val().Time())
-				}
-				_ = iter.Close()
-			}
+	}()
+
+	result := make([]*measurev1.DataPoint, 0)
+	for mIterator.Next() {
+		current := mIterator.Current()
+		if len(current) > 0 {
+			result = append(result, current[0])
 		}
 	}
 
-	now := time.Now().UnixNano()
-	resp = bus.NewMessage(bus.MessageID(now), aggregator.val(sourceMeasure.GetSchema().GetEntity().GetTagNames()))
-
+	resp = bus.NewMessage(bus.MessageID(now), toTopNResponse(result))
 	return
 }
 
-func locateEntity(topNSchema *databasev1.TopNAggregation, sortDirection modelv1.Sort,
-	conditions []*modelv1.Condition,
-) (tsdb.Entity, error) {
-	entityMap := make(map[string]int)
-	entity := make([]tsdb.Entry, 1+1+len(topNSchema.GetGroupByTagNames()))
-	// sortDirection
-	entity[0] = convert.Int64ToBytes(int64(sortDirection.Number()))
-	// rankNumber
-	entity[1] = tsdb.AnyEntry
-	for idx, tagName := range topNSchema.GetGroupByTagNames() {
-		entityMap[tagName] = idx + 2
-		// allow to make fuzzy search with partial conditions
-		entity[idx+2] = tsdb.AnyEntry
-	}
-	for _, pairQuery := range conditions {
-		if pairQuery.GetOp() != modelv1.Condition_BINARY_OP_EQ {
-			return nil, errors.New("op other than EQ is not supported")
+func toTopNResponse(dps []*measurev1.DataPoint) *measurev1.TopNResponse {
+	topNList := make([]*measurev1.TopNList, 0)
+	topNItems := make([]*measurev1.TopNList_Item, len(dps))
+	for i, dp := range dps {
+		topNItems[i] = &measurev1.TopNList_Item{
+			Entity: dp.GetTagFamilies()[0].GetTags(),
+			Value:  dp.GetFields()[0].GetValue(),
 		}
-		if entityIdx, ok := entityMap[pairQuery.GetName()]; ok {
-			switch v := pairQuery.GetValue().GetValue().(type) {
-			case *modelv1.TagValue_Str:
-				entity[entityIdx] = []byte(v.Str.GetValue())
-			case *modelv1.TagValue_Int:
-				entity[entityIdx] = convert.Int64ToBytes(v.Int.GetValue())
-			default:
-				return nil, errors.New("unsupported condition tag type for entity")
-			}
-			continue
-		}
-		return nil, errors.New("only groupBy tag name is supported")
 	}
-
-	return entity, nil
-}
-
-func parseTopNFamily(item tsdb.Item, interval time.Duration) (*streaming.Tuple2, error) {
-	familyRawBytes, err := item.Family(familyIdentity(measure.TopNTagFamily, pbv1.TagFlag))
-	if err != nil {
-		return nil, err
-	}
-	tagFamily := &modelv1.TagFamilyForWrite{}
-	err = proto.Unmarshal(familyRawBytes, tagFamily)
-	if err != nil {
-		return nil, err
-	}
-	fieldBytes, err := item.Family(familyIdentity(measure.TopNValueFieldSpec.GetName(),
-		pbv1.EncoderFieldFlag(measure.TopNValueFieldSpec, interval)))
-	if err != nil {
-		return nil, err
-	}
-	fieldValue, err := pbv1.DecodeFieldValue(fieldBytes, measure.TopNValueFieldSpec)
-	if err != nil {
-		return nil, err
-	}
-	return &streaming.Tuple2{
-		// GroupValues
-		V1: tagFamily.GetTags()[1:],
-		// FieldValue
-		V2: fieldValue.GetInt().GetValue(),
-	}, nil
-}
-
-func familyIdentity(name string, flag []byte) []byte {
-	return bytes.Join([][]byte{tsdb.Hash([]byte(name)), flag}, nil)
-}
-
-func (t *topNQueryProcessor) scanSeries(series tsdb.Series, request *measurev1.TopNRequest) ([]tsdb.Iterator, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	seriesSpan, err := series.Span(ctx, timestamp.NewInclusiveTimeRange(
-		request.GetTimeRange().GetBegin().AsTime(),
-		request.GetTimeRange().GetEnd().AsTime()),
-	)
-	if err != nil {
-		if errors.Is(err, tsdb.ErrEmptySeriesSpan) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	defer func(seriesSpan tsdb.SeriesSpan) {
-		if seriesSpan != nil {
-			_ = seriesSpan.Close()
-		}
-	}(seriesSpan)
-	seeker, err := seriesSpan.SeekerBuilder().OrderByTime(modelv1.Sort_SORT_ASC).Build()
-	if err != nil {
-		return nil, err
-	}
-	return seeker.Seek()
+	topNList = append(topNList, &measurev1.TopNList{
+		Items: topNItems,
+	})
+	return &measurev1.TopNResponse{Lists: topNList}
 }
 
 var _ heap.Interface = (*postAggregationProcessor)(nil)
@@ -254,13 +165,14 @@ func (n *aggregatorItem) GetTags(tagNames []string) []*modelv1.Tag {
 	return tags
 }
 
-// postProcessor defines necessary methods for Top-N post processor with or without aggregation.
-type postProcessor interface {
-	put(entityValues tsdb.EntityValues, val int64, timestampMillis uint64) error
-	val([]string) []*measurev1.TopNList
+// PostProcessor defines necessary methods for Top-N post processor with or without aggregation.
+type PostProcessor interface {
+	Put(entityValues tsdb.EntityValues, val int64, timestampMillis uint64) error
+	Val([]string) []*measurev1.TopNList
 }
 
-func createTopNPostAggregator(topN int32, aggrFunc modelv1.AggregationFunction, sort modelv1.Sort) postProcessor {
+// CreateTopNPostAggregator creates a Top-N post processor with or without aggregation.
+func CreateTopNPostAggregator(topN int32, aggrFunc modelv1.AggregationFunction, sort modelv1.Sort) PostProcessor {
 	if aggrFunc == modelv1.AggregationFunction_AGGREGATION_FUNCTION_UNSPECIFIED {
 		// if aggregation is not specified, we have to keep all timelines
 		return &postNonAggregationProcessor{
@@ -327,7 +239,7 @@ func (aggr *postAggregationProcessor) Pop() any {
 	return item
 }
 
-func (aggr *postAggregationProcessor) put(entityValues tsdb.EntityValues, val int64, timestampMillis uint64) error {
+func (aggr *postAggregationProcessor) Put(entityValues tsdb.EntityValues, val int64, timestampMillis uint64) error {
 	// update latest ts
 	if aggr.latestTimestamp < timestampMillis {
 		aggr.latestTimestamp = timestampMillis
@@ -374,7 +286,7 @@ func (aggr *postAggregationProcessor) tryEnqueue(key string, item *aggregatorIte
 	}
 }
 
-func (aggr *postAggregationProcessor) val(tagNames []string) []*measurev1.TopNList {
+func (aggr *postAggregationProcessor) Val(tagNames []string) []*measurev1.TopNList {
 	topNItems := make([]*measurev1.TopNList_Item, aggr.Len())
 
 	for aggr.Len() > 0 {
@@ -430,7 +342,7 @@ type postNonAggregationProcessor struct {
 	sort      modelv1.Sort
 }
 
-func (naggr *postNonAggregationProcessor) val(tagNames []string) []*measurev1.TopNList {
+func (naggr *postNonAggregationProcessor) Val(tagNames []string) []*measurev1.TopNList {
 	topNLists := make([]*measurev1.TopNList, 0, len(naggr.timelines))
 	for ts, timeline := range naggr.timelines {
 		items := make([]*measurev1.TopNList_Item, timeline.Len())
@@ -450,19 +362,18 @@ func (naggr *postNonAggregationProcessor) val(tagNames []string) []*measurev1.To
 		})
 	}
 
-	slices.SortStableFunc(topNLists, func(a, b *measurev1.TopNList) bool {
-		if a.GetTimestamp().GetSeconds() < b.GetTimestamp().GetSeconds() {
-			return true
-		} else if a.GetTimestamp().GetSeconds() == b.GetTimestamp().GetSeconds() {
-			return a.GetTimestamp().GetNanos() < b.GetTimestamp().GetNanos()
+	slices.SortStableFunc(topNLists, func(a, b *measurev1.TopNList) int {
+		r := int(a.GetTimestamp().GetSeconds() - b.GetTimestamp().GetSeconds())
+		if r != 0 {
+			return r
 		}
-		return false
+		return int(a.GetTimestamp().GetNanos() - b.GetTimestamp().GetNanos())
 	})
 
 	return topNLists
 }
 
-func (naggr *postNonAggregationProcessor) put(entityValues tsdb.EntityValues, val int64, timestampMillis uint64) error {
+func (naggr *postNonAggregationProcessor) Put(entityValues tsdb.EntityValues, val int64, timestampMillis uint64) error {
 	key := entityValues.String()
 	if timeline, ok := naggr.timelines[timestampMillis]; ok {
 		if timeline.Len() < int(naggr.topN) {
@@ -485,17 +396,15 @@ func (naggr *postNonAggregationProcessor) put(entityValues tsdb.EntityValues, va
 				return -1
 			} else if a.(*nonAggregatorItem).val == b.(*nonAggregatorItem).val {
 				return 0
-			} else {
-				return 1
 			}
+			return 1
 		}
 		if a.(*nonAggregatorItem).val < b.(*nonAggregatorItem).val {
 			return 1
 		} else if a.(*nonAggregatorItem).val == b.(*nonAggregatorItem).val {
 			return 0
-		} else {
-			return -1
 		}
+		return -1
 	}, false)
 	naggr.timelines[timestampMillis] = timeline
 	heap.Push(timeline, &nonAggregatorItem{val: val, key: key, values: entityValues})

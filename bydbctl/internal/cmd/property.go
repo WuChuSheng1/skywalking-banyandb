@@ -18,6 +18,8 @@
 package cmd
 
 import (
+	"strconv"
+
 	"github.com/go-resty/resty/v2"
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -67,7 +69,7 @@ func newPropertyCmd() *cobra.Command {
 					}
 					return request.req.SetPathParam("group", request.group).SetPathParam("name", request.name).
 						SetPathParam("id", request.id).SetBody(b).Put(getPath(propertySchemaPathWithoutTagParams))
-				}, yamlPrinter)
+				}, yamlPrinter, enableTLS, insecure, grpcCert)
 		},
 	}
 	bindFileFlag(applyCmd)
@@ -81,7 +83,7 @@ func newPropertyCmd() *cobra.Command {
 				return request.req.SetPathParam("name", request.name).SetPathParam("group", request.group).
 					SetPathParam("id", request.id).SetPathParam("tag", request.tags()).
 					Get(getPath(propertySchemaPathWithTagParams))
-			}, yamlPrinter)
+			}, yamlPrinter, enableTLS, insecure, grpcCert)
 		},
 	}
 
@@ -93,7 +95,7 @@ func newPropertyCmd() *cobra.Command {
 			return rest(parseFromFlags, func(request request) (*resty.Response, error) {
 				return request.req.SetPathParam("name", request.name).SetPathParam("group", request.group).
 					SetPathParam("id", request.id).SetPathParam("tag", request.tags()).Delete(getPath(propertySchemaPathWithTagParams))
-			}, yamlPrinter)
+			}, yamlPrinter, enableTLS, insecure, grpcCert)
 		},
 	}
 	bindNameAndIDAndTagsFlag(getCmd, deleteCmd)
@@ -109,13 +111,33 @@ func newPropertyCmd() *cobra.Command {
 				}
 				return request.req.SetPathParam("name", request.name).SetPathParam("group", request.group).
 					SetPathParam("ids", request.ids()).SetPathParam("tags", request.tags()).Get(getPath(propertyListSchemaPathWithTagParams))
-			}, yamlPrinter)
+			}, yamlPrinter, enableTLS, insecure, grpcCert)
 		},
 	}
 	listCmd.Flags().StringVarP(&name, "name", "n", "", "the name of the resource")
 	listCmd.Flags().StringArrayVarP(&ids, "ids", "", nil, "id selector")
 	listCmd.Flags().StringArrayVarP(&tags, "tags", "t", nil, "tag selector")
 
-	propertyCmd.AddCommand(getCmd, applyCmd, deleteCmd, listCmd)
+	var leaseID int64
+	keepAliveCmd := &cobra.Command{
+		Use:     "keepalive -i lease_id",
+		Version: version.Build(),
+		Short:   "Keep alive a property",
+		RunE: func(_ *cobra.Command, _ []string) (err error) {
+			return rest(func() ([]reqBody, error) {
+				if leaseID == 0 {
+					return nil, errMalformedInput
+				}
+				return []reqBody{{leaseID: leaseID}}, nil
+			}, func(request request) (*resty.Response, error) {
+				return request.req.SetPathParam("lease_id", strconv.FormatInt(request.leaseID, 10)).
+					Put(getPath(propertySchemaPath + "/lease/{lease_id}"))
+			}, yamlPrinter, enableTLS, insecure, grpcCert)
+		},
+	}
+	keepAliveCmd.Flags().Int64VarP(&leaseID, "lease_id", "i", 0, "the lease id of the property")
+
+	bindTLSRelatedFlag(getCmd, applyCmd, deleteCmd, listCmd, keepAliveCmd)
+	propertyCmd.AddCommand(getCmd, applyCmd, deleteCmd, listCmd, keepAliveCmd)
 	return propertyCmd
 }
